@@ -1,0 +1,41 @@
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          cognito:
+            clientId: spring-boot-application
+            clientSecret: m4x9aF8OE8xOzwFcRuFCoVQRg39HrGys
+            scope: openid
+            redirectUri: http://localhost:8080/login/oauth2/code/cognito
+        provider:
+          cognito:
+            issuerUri: http://localhost:8888/auth/realms/stratospheric
+  datasource:
+    url: jdbc:postgresql://localhost:5432/stratospheric
+    username: stratospheric
+    password: stratospheric
+  cloud:
+    aws:
+      endpoint: http://localhost:4566
+      region:
+        static: us-east-1
+      credentials:
+        access-key: foo
+        secret-key: bar
+  mail:
+    host: localhost
+    port: 1025
+    properties:
+      mail:
+        smtp:
+          auth: false
+          starttls:
+            enable: false
+
+custom:
+  use-cognito-as-identity-provider: false
+  sharing-queue: stratospheric-todo-sharing
+  auto-confirm-collaborations: true
+  confirm-email-from-address: noreply@stratospheric.dev
+  external-url: http://localhost:8080

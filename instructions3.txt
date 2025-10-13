@@ -1,0 +1,906 @@
+ Sharing Todos with Amazon SQS and
+Amazon SES
+With this chapter, we’ll implement the next feature for our Todo application and
+integrate two new AWS services: SQS (Simple Queue Service) and SES (Simple
+Email Service).
+So far, the users of our application only work on their todos by themselves. As
+this seems rather boring, we’d like to foster some collaboration among our user
+base.
+The upcoming feature allows the owner of a todo to share it with other users
+of our application. This way, they can collaboratively work on the task at hand.
+Similar to the workflow of typical collaborative applications, the user a todo has
+been shared with gets a notification and has to accept the collaboration first.
+Technically speaking, we’re going to decouple this feature into two operations.
+Whenever a user decides to share one of their todos, we’ll first store this request
+in an SQS queue. The queue acts as a buffer, and another part of our application
+will then handle the incoming requests and send out emails.
+This chapter has two parts that iteratively build the sharing feature. We’ll
+start with the messaging component and learn how to send and receive SQS
+messages. Next comes the email sending part, where we integrate Amazon SES.
+Let’s get started and first understand how the fully managed messaging service
+from AWS (SQS) can help us build resilient and decoupled applications.
+All upcoming code examples are available on GitHub.
+12. Sharing Todos with Amazon SQS and Amazon SES 255
+Using Amazon SQS for Asynchronous Workloads
+Before we jump into integrating Amazon SQS with our Spring Boot application,
+let’s take a look at how this AWS service works.
+Introduction to Amazon SQS
+Amazon SQS is a fully managed messaging service. We can use this service
+to pass messages between different parts of our system in a highly scalable
+fashion. It allows point-to-point communication where only one receiver will
+handle the message at a given time. Amazon SQS can further help us integrate
+or decouple components in a distributed architecture.
+The messages that we process with SQS can have a payload with a maximum size
+of 256 KB. It allows server-side encryption of our messages, and we can control
+access to it. We interact with SQS via a generic HTTPS API, similar to other AWS
+services. Depending on the configuration, SQS can persist our message for a
+“retention period” of up to 14 days.
+Scalability, durability, and reliability of our processing with SQS depend on the
+queue type. AWS offers two different SQS types: FIFO and Standard.
+With the Standard queue type, messages will get delivered with a best-effort
+ordering. SQS won’t ensure a strict message order for this queue type, and oc-
+casionally the messages are delivered out of order. Furthermore, the messages
+are delivered at least once. Our receiver might consume the same message more
+than once. Despite having these downsides, this type of queue offers nearly
+unlimited throughput (according to the AWS documentation). It’s the cheapest
+option, too.
+As the name implies, the FIFO queue type follows a first-in-first-out delivery
+12. Sharing Todos with Amazon SQS and Amazon SES 256
+model. This type of queue guarantees to deliver messages in the same order
+they were sent to the queue. Each message will be processed exactly once,
+avoiding that our consumer receives duplicates. The strict consistency results
+in a 25% higher AWS bill compared to the Standard queue type. When it comes
+to scalability, FIFO queues will handle up to 3,000 messages per second. We can
+increase this limit by getting in contact with AWS support.
+The pricing model of Amazon SQS has no upfront costs. After we exceed the first
+free one million requests per month, we’re charged for the number of requests
+and the outbound data transfer.
+The basic operations we perform against the SQS API are SendMessage, Re-
+ceiveMessage, and DeleteMessage. Every message will remain in the queue
+until a consumer actively deletes it from the queue. In other words, Amazon SQS
+doesn’t automatically remove a message when it’s consumed, but the consumer
+has to acknowledge the successful processing of the message by deleting it.
+SQS clients have to proactively perform the ReceiveMessage operation regu-
+larly to consume and check for new messages. Amazon SQS won’t push mes-
+sages to a particular client.
+To avoid parallel message consumption, Amazon SQS has the concept of a
+visibility timeout. This timeout defines the period after which a message will
+be made available again to all consumers after one consumer has received it.
+Whenever a consumer doesn’t delete the message within the given timeout
+period (due to slow processing, for example), SQS will replay the message by
+including it in the response of a following ReceiveMessage API call. Hence, we
+should configure this value to the maximum amount of time it takes to process
+a single message. We can define the visibility timeout for both the entire queue
+or on each ReceiveMessage request individually.
+To avoid receiving the same unprocessable message over and over again (for
+12. Sharing Todos with Amazon SQS and Amazon SES 257
+example due to an invalid payload or a downtime of a remote system), Amazon
+SQS supports the concept of so-called Dead-Letter Queues (DLQ for short).
+Dead-Letter Queues
+Each Amazon SQS message has a ReceiveCount attribute that stores a counter
+and tracks how often the message has been consumed already. As part of the
+queue configuration, we can define a maxReceiveCount to specify how many
+processing attempts our messages have until they’re moved to a dead-letter
+queue.
+A dead-letter queue is just another Amazon SQS queue that stores unprocess-
+able messages. The type of this queue has to match the type of the source queue.
+In other words, a FIFO queue can only target a FIFO queue as a dead-letter queue.
+DLQs are optional, so we can define Amazon SQS queues without specifying a
+DLQ.
+However, it’s a general best practice to create a DLQ for each of our processing
+queues due to several reasons:
+• It helps to analyze and debug error scenarios.
+• We isolate problematic messages for further investigations.
+• We reduce the load on our system if there are multiple (if not thousands) of
+unprocessable messages.
+• We get improved observability, as we can define alarms for our dead-letter
+queues to detect failures early.
+• We don’t block the message processing by consuming the same faulty
+message over and over.
+The strategy for handling these dead messages highly depends on the use case
+and error scenario. In case there was a temporary hiccup (for example a remote
+12. Sharing Todos with Amazon SQS and Amazon SES 258
+system we depend on was not available), we can move the messages back to our
+source queue for processing.
+Amazon SQS vs. AWS SNS vs. Amazon MQ
+Amazon SQS is not the only messaging service in the AWS service portfolio.
+While Amazon SQS is a queuing service (point-to-point), with AWS SNS (Simple
+Notification Service), we can inform multiple receivers for each message. This is
+known as the publish-subscribe pattern that internally works with topics that
+several consumers subscribe to.
+Both Amazon SQS and AWS SNS are highly scalable and require zero setup as
+AWS fully manages them.
+In contrast to that, with Amazon MQ we can bootstrap a managed Apache Ac-
+tiveMQ or RabbitMQ instance. Both are message brokers that support multiple
+traditional APIs (JMS) as well as a variety of messaging protocols (AMQS, MQTT,
+STOMP, etc.).
+We’ll discuss Amazon MQ and ActiveMQ, together with other messaging and
+notification capabilities of AWS, in greater detail as part of the upcoming
+chapter Push Notifications with Amazon MQ.
+That’s enough theory for now. Let’s dive right into implementing the sharing
+feature. As a first step, we’ll create the required AWS resources with AWS CDK.
+Creating the Amazon SQS Setup with CDK
+As a quick reminder, we’ll create the Amazon SQS queue to technically decouple
+the todo sharing feature and send a message to SQS whenever a user decides to
+invite a collaborator for their todo. Sending the actual invitation email then is
+the responsibility of the SQS message consumer.
+12. Sharing Todos with Amazon SQS and Amazon SES 259
+For our use case, the standard Amazon SQS queue fits our purpose. We don’t
+need strict message ordering because it doesn’t really matter which email we
+send first. Also, we don’t care much if we receive a message twice, because we
+could store in the database who we sent an email to already, so that the same
+user doesn’t get the email twice.
+We’ll create a new CDK app for the messaging-related parts of our application.
+You can find the code for this app on GitHub. For this MessagingApp we don’t
+need any additional input parameters except the default ones:
+public class MessagingApp {
+public static void main(final String[] args) {
+App app = new App();
+// omitted standard configuration values like the AWS region and sanity checks
+Environment awsEnvironment = makeEnv(accountId, region);
+ApplicationEnvironment applicationEnvironment = new ApplicationEnvironment(
+applicationName,
+environmentName
+);
+new MessagingStack(
+app,
+"messaging"
+,
+awsEnvironment,
+applicationEnvironment);
+app.synth();
+}
+}
+As the Amazon SQS CDK module comes with stable level 2 constructs, we can
+conveniently create our Amazon SQS resources and don’t have to work with low-
+level CloudFormation constructs. Inside the MessagingStack, we create both
+our Amazon SQS processing and dead-letter queues:
+12. Sharing Todos with Amazon SQS and Amazon SES 260
+this.todoSharingDlq = Queue.Builder.create(this,
+"todoSharingDlq")
+.queueName(applicationEnvironment.prefix( "todo-sharing-dead-letter-queue"))
+.retentionPeriod(Duration.days(14))
+.build();
+this.todoSharingQueue = Queue.Builder.create(this,
+"todoSharingQueue")
+.queueName(applicationEnvironment.prefix("todo-sharing-queue"))
+.visibilityTimeout(Duration.seconds(30))
+.retentionPeriod(Duration.days(14))
+.deadLetterQueue(DeadLetterQueue.builder()
+.queue(todoSharingDlq)
+.maxReceiveCount(3)
+.build())
+.build();
+For both queues, we set the retentionPeriod to the maximum duration of 14
+days. This gives us enough time to analyze the underlying issue even if a first
+alarm gets overlooked, or our development team is on Christmas vacation.
+We set the visibilityTimeout to 30 seconds, which should give our Spring
+Boot application plenty of time to store the collaboration request in the
+database and send an email. We can always tweak this value as soon as we have
+a good understanding of our application’s behavior in production.
+We connect the main processing queue with the dead-letter queue by passing
+the field todoSharingDlq to the DeadLetterQueue builder. With the maxRe-
+ceiveCount set to 3, Amazon SQS will move the message to the DLQ if our
+application fails to delete the message from the queue at the fourth processing
+attempt.
+Unless we call the method fifo(true) on the construct, the created SQS queue
+will be a standard SQS queue. In case we opt-in for a FIFO queue type, the queue
+name must end with the .fifo suffix.
+Next, we have to expose the name of the SQS queue our application will connect
+to:
+12. Sharing Todos with Amazon SQS and Amazon SES StringParameter.Builder.create(this,
+"todoSharingQueueName")
+.parameterName(createParameterName(
+applicationEnvironment,
+PARAMETER_TODO_SHARING_QUEUE_NAME))
+.stringValue(this.todoSharingQueue.getQueueName())
+.build();
+261
+This stores the name of the queue in the SSM parameter store so we can later
+use it to configure our Spring Boot application. Spring Cloud AWS accepts both
+the logical and physical names for a queue. Internally, it will fetch the queue
+URL as the AWS SDK for SQS requires this URL for receiving messages.
+We won’t connect to the dead-letter queue from our application. Messages
+might end up in the DLQ for several reasons. We can’t really implement an
+automatic procedure to understand what went wrong. Therefore, manual in-
+spection is the only feasible approach here. For now, though, it’s enough to
+isolate unprocessable messages. Later on, we can create an AWS CloudWatch
+alarm to get notified as soon as the first message arrives in this queue.
+With the Amazon SQS resource definition in place, our application now requires
+access to the processing queue. Similar to how we have configured access to
+Amazon Cognito in the chapter Building User Registration and Login with Cognito,
+we add a new PolicyStatement as part of our Service construct:
+12. Sharing Todos with Amazon SQS and Amazon SES 262
+.withTaskRolePolicyStatements(List.of(
+// ... skipping other PolicyStatements,
+PolicyStatement.Builder.create()
+.sid("AllowSQSAccess")
+.effect(Effect.ALLOW)
+.resources(List.of(
+String.format("arn:aws:sqs:%s:%s:%s", region, accountId,
+messagingOutputParameters.getTodoSharingQueueName())
+))
+.actions(Arrays.asList(
+"sqs:DeleteMessage"
+,
+"sqs:GetQueueUrl"
+,
+"sqs:ListDeadLetterSourceQueues"
+"sqs:ListQueues"
+,
+"sqs:ListQueueTags"
+,
+"sqs:ReceiveMessage"
+,
+"sqs:SendMessage"
+,
+"sqs:ChangeMessageVisibility"
+,
+"sqs:GetQueueAttributes"))
+.build()
+,
+))
+This gives our application the necessary permissions to send, receive, and delete
+messages for any Amazon SQS queue as we’ve used the * wildcard. We can now
+start to integrate Amazon SQS into our Todo application.
+Using Amazon SQS for Our Todo Application
+As a first step, we have to add a new dependency to our project:
+dependencies {
+// omitted other dependencies
+implementation 'io.awspring.cloud:spring-cloud-starter-aws-messaging'
+}
+The version of this dependency is managed by the Spring Cloud BOM that we
+already included as part of the core dependencies in the chapter * The Sample
+12. Sharing Todos with Amazon SQS and Amazon SES 263
+Todo Application*. The Spring Cloud AWS Messaging module comes with the
+following features for both Amazon SQS and AWS SNS:
+• Annotation-driven listener/notification endpoints.
+• Integration with the Spring Messaging API (fully for SQS, partially for SNS).
+• Serialization support for messages (which SQS only knows as strings).
+• Convenient access via SqsTemplate (SQS) and NotificationMessag-
+ingTemplate (SNS).
+In the upcoming sections, we won’t cover any AWS SNS-specific features of
+Spring Cloud AWS and focus on Amazon SQS.
+To set our Spring Boot application up for SQS, there’s only one thing left to do.
+The SqsTemplate that we’ll use to conveniently access Amazon SQS is not auto-
+configured by default. In favor of this abstraction and to avoid any interaction
+with the low-level AWS Java SDK, we add a bean of type SqsTemplate to our
+application context:
+@Configuration
+public class MessagingTemplateConfig {
+@Bean
+public SqsTemplate sqsTemplate(
+SqsAsyncClient sqsAsyncClient) {
+return SqsTemplate.newTemplate(sqsAsyncClient);
+}
+}
+Spring Cloud AWS auto-configures the Amazon SQS Java SDK AmazonSQSAsync
+for us.
+Let’s start with the first step and send a message to SQS whenever a user decides
+to invite a collaborator to one of their todos.
+12. Sharing Todos with Amazon SQS and Amazon SES 264
+Sending Messages to Amazon SQS
+To allow users to add collaborators, we enhance the action items of a todo with
+a drop-down element. Inside the drop-down, our users will find a list of all
+available collaborators to share their tasks with. This new element is displayed
+for each todo that the user owns:
+Sharing a todo with a collaborator.
+We create this element as part of the <table> that visualizes each todo inside
+the dashboard.html view:
+<div class="dropdown-menu" aria-labelledby="dropdownMenuLink">
+<span class="dropdown-item" th:if="${collaborators.isEmpty()}">
+No collaborator available
+</span>
+<form th:method="POST"
+th:each="collaborator : ${collaborators}"
+th:action="@{/todo/{todoId}/collaborations/{collaboratorId}
+(todoId=${todo.id}, collaboratorId=${collaborator.id})}">
+<button
+th:text="${collaborator.name}"
+type="submit"
+name="submit"
+class="dropdown-item">
+</button>
+</form>
+</div>
+12. Sharing Todos with Amazon SQS and Amazon SES 265
+The ${collaborators} attribute is populated as part of the Spring MVC con-
+troller endpoint for the dashboard view and contains a list of all available col-
+laborators. Users will be able to share their todo with any user of our application
+except themselves and only if they are the todo owner.
+The TodoCollaborationController takes incoming collaboration requests
+and passes them to the TodoCollaborationService to start the sharing
+process:
+@Controller
+@RequestMapping("/todo")
+public class TodoCollaborationController {
+private final TodoCollaborationService todoCollaborationService;
+public TodoCollaborationController(
+TodoCollaborationService todoCollaborationService) {
+this.todoCollaborationService = todoCollaborationService;
+}
+@PostMapping("/{todoId}/collaborations/{collaboratorId}")
+public String shareTodoWithCollaborator(
+@PathVariable("todoId") Long todoId,
+@PathVariable("collaboratorId") Long collaboratorId,
+RedirectAttributes redirectAttributes
+) {
+String collaboratorName = todoCollaborationService
+.shareWithCollaborator(todoId, collaboratorId);
+// add success message
+return "redirect:/dashboard";
+}
+}
+In this service, we first verify that both the collaborator and the todo exist in
+our database. Next, we ensure that the user is the owner of the Todo and no
+equivalent collaboration request is currently active.
+12. Sharing Todos with Amazon SQS and Amazon SES 266
+We store each new collaboration request in our PostgreSQL database. The
+TodoCollaborationRequest JPA entity contains the relevant information
+about the invite. For an additional layer of security, we create a random token
+for each collaboration request that is required for accepting the invite:
+@Service
+@Transactional
+public class TodoCollaborationService {
+// more fields (Spring Data JPA repositories, etc.)
+private final SqsTemplate sqsTemplate;
+private final String todoSharingQueueName;
+public String shareWithCollaborator(Long todoId, Long collaboratorId) {
+// check if todo and collaborator exists
+// return if there's already an active collaboration request
+TodoCollaborationRequest collaboration = new TodoCollaborationRequest();
+collaboration.setToken(UUID.randomUUID().toString());
+collaboration.setCollaborator(collaborator);
+collaboration.setTodo(todo);
+todo.getCollaborationRequests().add(collaboration);
+todoCollaborationRequestRepository.save(collaboration);
+sqsTemplate.send(todoSharingQueueName,
+new TodoCollaborationNotification(collaboration));
+return collaborator.getName();
+}
+}
+To transmit the collaboration information, we populate a TodoCollabora-
+tionNotification object. This acts as a data transfer object (DTO) and
+contains the relevant information about the collaboration request.
+Instead of including a full TodoCollaborationNotification object in the SQS
+12. Sharing Todos with Amazon SQS and Amazon SES 267
+message, we could make the message contain only the ID of the TodoCollab-
+orationRequest entity. In this scenario, the consumer of a message would
+have to use this ID to load the request from the database again. We opted
+for a “flattened” approach that includes all information necessary to send
+an email. This further decouples the email sending feature from the rest of
+our application. There’s one downside to this solution, however: The invited
+person might see outdated information about the todo since the owner can
+update the todo between sending the collaboration request and waiting for the
+confirmation. However, we decided that this is acceptable.
+As the last step, we use the SqsTemplate to send a message to a specified SQS
+queue. The send() method will serialize the Java object to a JSON string before
+sending it to SQS.
+With this setup, new messages will now queue up inside our SQS queue. In case
+we don’t consume the messages within 14 days (the retentionPeriod of our
+queue), they’ll be gone. To avoid this scenario and unhappy users, we now need
+to consume the messages. Let’s connect to the SQS queue as a consumer to
+further process the collaboration requests.
+Receiving Amazon SQS Messages with Spring Cloud AWS
+The responsibility of our consumer is to inform the invited collaborator via
+email. For demonstration purposes and to avoid bootstrapping a new service,
+we’ll self-consume the messages in the same application.
+Why do we then go the extra mile and send a message to SQS - couldn’t we just
+send out the email right inside the TodoCollaborationService? Of course we
+could, but this would couple the email sending with the rest of our application.
+By using an SQS queue in between, we decouple the inviting logic from the
+email sending logic and gain the flexibility to easily move these features around
+within our codebase (or even into another codebase).
+12. Sharing Todos with Amazon SQS and Amazon SES 268
+Also, the SQS queue between these two operations acts as a buffer. This gives
+us an implicit retry mechanism because, with our maxReceiveCount, we try
+processing the message up to four times. As we’re building a distributed system
+and have to integrate with a cloud provider, literally everything can go wrong.
+Hence, we should be prepared for failure. On top of this, we can control the
+email sending throughput by throttling the number of messages we consume.
+This helps with staying within the boundaries of potential email sending limits.
+Spring Cloud AWS provides two ways of consuming messages:
+• using an annotation-driven listener, and
+• using the receive() method of the SqsTemplate.
+While calling receive() explicitly is useful for on-demand message consump-
+tion, with an annotated listener class, we’re continuously polling messages
+with a background thread and can process messages almost in real time. We
+can also directly interact with the SQS client (AmazonSQS) via the AWS Java SDK
+but in that case, we’d lose the Spring Messaging abstraction and have to deal
+with the low-level API instead.
+The actual listener class is a standard Spring bean. Any public method of this
+class that uses the @SqsListener annotation acts as an SQS handler method.
+This annotation expects a list of logical or physical SQS queue names. For our
+use case, we only listen to one queue, but we could also define the same handler
+for multiple SQS queues:
+12. Sharing Todos with Amazon SQS and Amazon SES 269
+@Component
+public class TodoSharingListener {
+@SqsListener(value = "${custom.sharing-queue}")
+public void listenToSharingMessages(TodoCollaborationNotification payload) {
+// upcoming implementation to notify collaborator via email and AWS ES
+LOG.info("Incoming todo sharing payload: {}", payload);
+}
+}
+As part of the listener’s method argument, we can define the expected Java
+object. Spring Cloud AWS, and in this particular case its Spring Messaging
+integration, is responsible for extracting the message payload and resolving
+it using a PayloadMethodArgumentResolver. By default, this makes use of
+the MappingJackson2MessageConverter for deserializing the incoming JSON
+message (of type String) to a Java object using Jackson’s ObjectMapper.
+Acknowledging Amazon SQS Messages with Spring Cloud AWS
+So far, we consume the incoming SQS message, extract its payload and convert
+it to a Java object. One key responsibility of the SQS listener is still missing:
+deleting the message after processing it.
+Recall that a message will remain inside SQS until the consumer explicitly
+deletes it. The process of receiving a message won’t delete it from the queue.
+Hence, after (successfully) processing the message, we have to acknowledge it
+by deleting the message from the queue.
+The AWS Java SQS SDK provides a low-level method for this purpose:
+deleteMessage(). This method expects the message’s receipt handle. This
+handle is up to 1024 characters long and identifies a particular message
+consumption event.
+12. Sharing Todos with Amazon SQS and Amazon SES 270
+Spring Cloud AWS provides an abstraction on top of this so that we don’t have
+to keep track of all receipt handles and manage the message deletion on our
+own. For annotation-driven SQS listeners, we can specify a deletion policy. In
+case we’re using the receive() message of the SqsTemplate, the message will
+be deleted right away.
+Spring Cloud AWS defines the following four deletion policies as part of the
+SqsMessageDeletionPolicy enum:
+• ALWAYS: The outcome of the processing is irrelevant (success or exception)
+as the message will be deleted every time.
+• NEVER: We’re in charge of deleting the message.
+• NO_REDRIVE: Deletes the message on success and in case of an exception
+only if no re-drive policy is configured for the queue. This is the default.
+• ON_SUCCESS: Deletes the message unless an exception is thrown during the
+processing.
+Since, with our dead-letter queue, we’ve configured a re-drive policy for our SQS
+setup, the default NO_REDRIVE deletion policy is sufficient. Whenever our mes-
+sage processing finishes without an exception, Spring Cloud AWS will delete
+the message. If our message processing throws an exception, the message
+will remain inside the queue, and we’ll retry processing the message after the
+visibilityTimeout has elapsed, until it lands in the dead-letter queue after
+too many failed attempts.
+Nevertheless, let’s see what a deletion policy of NEVER would look like. We can
+configure the deletionPolicy per SQS listener as part of the @SqsListener
+annotation:
+12. Sharing Todos with Amazon SQS and Amazon SES 271
+@SqsListener(value = "${custom.sharing-queue}", deletionPolicy = NEVER)
+public void listenToSharingMessages(
+TodoCollaborationNotification payload,
+Acknowledgment acknowledgment) {
+// perform processing
+if(successfulProcessing) {
+acknowledgment.acknowledge();
+}
+}
+With this deletion policy, Spring Cloud AWS will never automatically delete a
+message for us. We can inject an Acknowledgement object and take full control
+of when to acknowledge (i.e. delete) the message.
+Please note that the acknowledge() method returns a Java Future, and we
+might want to wait for its result to resolve. The message deletion itself inter-
+nally is just another HTTP request to AWS, which can fail anytime.
+On top of this, we can resolve headers of an SQS message in case they’re
+important for our message processing:
+@SqsListener(value = "${custom.sharing-queue}")
+public void listenToSharingMessages(
+TodoCollaborationNotification payload,
+@Headers Map<String, Object> headers) {
+}
+It’s also possible to resolve a specific header using the @Header("HEADER_-
+NAME") annotation.
+With our SQS message listener in place, it’s now time to inform the collaborator
+via email. Let’s see how Amazon SES can help us here and how we can integrate
+this particular AWS service with our Spring Boot backend in the following
+section.
+12. Sharing Todos with Amazon SQS and Amazon SES 272
+Sending Emails with Amazon SES
+The second part of this chapter implements the missing email notification for
+our collaboration feature to be finished. We’ll integrate Amazon Simple Email
+Service (SES) with our sample Todo application to inform a collaborator about a
+shared Todo.
+Introduction to Amazon SES
+Amazon SES (Simple Email Service) is an easy-to-set-up email sending and
+receiving service. Managing an on-premise email infrastructure is a complex
+topic. With Amazon SES, we take advantage of years of email infrastructure
+experience at Amazon.
+We can interact with Amazon SES via the AWS SDK, the Amazon SES SMTP
+interface or the Amazon SES API directly.
+The possible use cases for Amazon SES range from classic transactional emails
+(like sign-up confirmations) to marketing and newsletter-like email correspon-
+dence. We’re billed based on the number of emails we send and receive. There
+are no upfront costs for licensing or server resources.
+Furthermore, Amazon SES is available in several regions. Each AWS account has
+sandbox access for Amazon SES in the available regions by default. We’ll find
+out more about this sandbox access in the following section.
+Amazon SES comes with email sending quotas to prevent fraud and maintain a
+good IP address reputation. These quotas define how many emails we can send
+per day and the maximum number of emails we can send per second. We can
+configure those quotas per region by getting in contact with the AWS Support
+Center.
+12. Sharing Todos with Amazon SQS and Amazon SES 273
+The default quota depends on the Amazon SES instance type, which we’re about
+to explore in the next section.
+Creating the Amazon SES Instance
+Unlike with other AWS services like AWS S3 or Amazon SQS, there’s no need
+to create an Amazon SES instance as all new AWS accounts are placed in the
+Amazon SES sandbox by default. We won’t find any CloudFormation resources
+or CDK constructs to create the Amazon SES instance for a given region as it’s
+already available.
+However, there are Amazon SES-specific resources that we can bootstrap with
+infrastructure-as-code (either CloudFormation or CDK).
+With AWS::SES::Template, for example, we can configure reusable email tem-
+plates. In case we want to define rules for incoming emails (for example to store
+them in an S3 bucket), we can create an AWS::SES::ReceiptRule resource. We
+won’t use any of these resources for our sample Todo application as we only
+need the bare minimum feature of Amazon SES: sending emails.
+There’s one minor adjustment for our existing CDK infrastructure setup. As
+we’re about to send emails from our Spring Boot application, the ECS task
+role requires sufficient permissions for the Amazon SES API. We’ll add a new
+PolicyStatement to our Service AWS CDK construct:
+12. Sharing Todos with Amazon SQS and Amazon SES 274
+.withTaskRolePolicyStatements(List.of(
+// ... existings policy statements
+PolicyStatement.Builder.create()
+.sid("AllowSendingEmails")
+.effect(Effect.ALLOW)
+.resources(
+List.of(String.format(
+"arn:aws:ses:%s:%s:identity/stratospheric.dev", region, accountId))
+)
+.actions(List.of(
+"ses:SendEmail"
+,
+"ses:SendRawEmail"
+))
+.build()
+))
+When working with Amazon SES, it’s crucial to understand the implications of
+sandbox access. As the name applies, it comes with several restrictions:
+• we can only send emails to verified email addresses,
+• we can only send emails from verified domains and email addresses,
+• we can only send 200 emails within 24 hours, and
+• we can only send one email per second.
+These restrictions might be acceptable for development and testing purposes
+with minimal and foreseeable email correspondence, but not for production.
+Before we can effectively use Amazon SES, we therefore first have to move out
+of the sandbox environment and request production access.
+Requesting Amazon SES Production Access
+The Amazon SES sandbox access we’re assigned to by default limits the usage
+for production. Not only are the sending quotas low but we also have to verify
+each and every email address before we even contact the user for the first time.
+This prevents seamless operation.
+12. Sharing Todos with Amazon SQS and Amazon SES 275
+That’s why we should request production access as soon as our application is
+about to go live for the first time. Requesting production access is a one-time
+manual effort by way of a support ticket.
+To request Amazon SES production access, we have to file an AWS support
+ticket. As part of this ticket, we have to specify our website’s URL, our use case,
+additional contact information, and which type of emails we’re about to send.
+For our collaboration feature, the correct type is TRANSACTIONAL (for emails like
+order confirmations), as the alternative would be PROMOTIONAL (for marketing-
+related emails).
+This ticket triggers a verification process on the AWS side and can take up to
+24 hours. In case we’re operating in several AWS regions, we have to request
+Amazon SES production access for each region once.
+For an up-to-date and visual step-by-step guide on how to request
+production access, please take a look at the Amazon SES documentation.
+As the Amazon SES console is currently transitioning from v1 to v2,
+screenshots might become outdated quite soon.
+Once the production access is enabled, we can request an increase (if needed) of
+our Amazon SES sending quotas (sending rate and number of emails per day).
+This step is optional and can be accomplished with an additional support ticket.
+With the Amazon SES production access in place, we first need to verify our
+domain before sending emails from our Spring Boot application.
+Verifying a Domain
+To send emails with Amazon SES, we have to verify each identity (domain name)
+that we’re going to use as part of “From”, “Source”, “Sender”, or “Return-
+Path” to avoid unauthorized usage. Our goal is to send confirmation emails from
+noreply@stratospheric.dev for implementing our todo sharing feature.
+12. Sharing Todos with Amazon SQS and Amazon SES 276
+The process to verify a domain identity is a one-time effort inside the AWS
+Management Console.
+For an up-to-date guide on verifying domain identities, please follow the
+steps as described in the AWS documentation.
+During this process, we’re asked if we want to create DKIM (DomainKeys
+Identified Mail) settings for this domain identity. By signing our email message
+with the DKIM private key, we can prove that the email originates from our
+domain. DKIM signatures are stored in our domain’s DNS records. Receivers can
+verify such a signature to ensure the message wasn’t modified in transit. As a
+general recommendation, we should opt-in for the DKIM settings to improve
+our email delivery rates.
+To verify that we’re the owner of the domain, we need to update the DNS
+settings of our domain. At the end of the domain identity creation process, we
+can download a .csv file with the required record set changes.
+In case we’re using Route 53 as our DNS provider, Amazon’s own DNS service,
+our DNS settings are updated automatically. What’s left is to wait until the
+Amazon SES console reports our domain as verified.
+If we’re using a different DNS provider (GoDaddy, Namecheap, Cloudflare, you
+name it), we have to update the DNS settings of our domain ourselves. As we’re
+dealing with changes to our DNS settings, the propagation to all other DNS
+servers can take up to 48 hours. Most of the time, however, the propagation
+is a matter of hours.
+With stratospheric.dev being a verified Amazon SES domain, we can start
+implementing the email confirmation.
+12. Sharing Todos with Amazon SQS and Amazon SES 277
+Using Amazon SES for Our Todo Application
+Both the Spring framework and Spring Cloud AWS provide excellent support for
+sending emails from our Java backend. Spring defines two central interfaces for
+doing so: MailSender and JavaMailSender. The latter inherits from the former
+and adds support for sending MIME messages via email.
+In general, Spring provides utility methods and a convenient abstraction on top
+of the JavaMail standard API (nowadays Jakarta Mail).
+While Spring’s email support is agnostic to the underlying mailing system,
+Spring Cloud AWS provides an implementation of both interfaces that use
+Amazon SES as the underlying transport system.
+To get started, we add the following Spring Cloud AWS dependency to our
+build.gradle file:
+dependencies {
+implementation 'io.awspring.cloud:spring-cloud-aws-starter-ses'
+}
+An instance of the Amazon SES SDK client SesClient is auto-configured for us.
+We can either interact with the SDK client directly or use the already mentioned
+MailSender or JavaMailSender, for which Spring Cloud AWS auto-configures
+an implementation, which in turn uses Amazon SES internally.
+With this setup in place, we can start to send emails to our users.
+Sending Emails to Invite Collaborators
+We’ll continue with the implementation where we left off at the end of the
+previous section. We already have the @SqsListener in place to consume our
+Amazon SQS collaboration request messages. What’s missing is to inform the
+collaborator by sending an email.
+12. Sharing Todos with Amazon SQS and Amazon SES 278
+Spring’s MailSender is sufficient for our use case as we’re not sending complex
+emails with attachments or more involved formatting that would require the
+usage of JavaMailSender. We can inject the auto-configured MailSender into
+our TodoSharingListener and create the email message based on the incoming
+payload:
+@Component
+public class TodoSharingListener {
+private final MailSender mailSender;
+public TodoSharingListener(MailSender mailSender) {
+this.mailSender = mailSender;
+}
+@SqsListener(value = "${custom.sharing-queue}", deletionPolicy = ON_SUCCESS)
+public void listenToSharingMessages(TodoCollaborationNotification payload) {
+SimpleMailMessage message = new SimpleMailMessage();
+message.setFrom("noreply@stratospheric.dev");
+message.setTo(payload.getCollaboratorEmail());
+message.setSubject("A todo was shared with you");
+message.setText("Nicely formatted text including the confirmation link");
+mailSender.send(message);
+}
+}
+As we’ve confirmed the domain identity for our stratospheric.dev domain,
+we can use noreply@stratospheric.dev as the email sender. With Amazon
+SES production access enabled, we can also send emails to any destination and
+don’t have to confirm every target manually.
+The actual email body formatting is omitted for brevity’s sake in the code
+example above (but available on GitHub). It contains metadata about the todo
+(title, due date, description, etc.) and, most notably, the confirmation link with
+a short-lived token.
+12. Sharing Todos with Amazon SQS and Amazon SES 279
+Before carrying on, let’s recall the implications of using the AWS default SQS
+queue type. When working with the default queue type (instead of FIFO), we
+have to keep in mind that messages are delivered at least once. This would
+mean our application could send the same invitation email multiple times in
+our concrete example. While the likelihood of this is relatively rare and the
+business impact might be acceptable (we’d just annoy the collaborator …), we
+can mitigate that risk.
+To avoid duplicate actions or inconsistent data when receiving the same mes-
+sage twice, we can design the message processing in an idempotent manner.
+An operation is idempotent if it produces the same result for the same
+input even when it’s executed multiple times. In our context, to have
+idempotent processing, consuming the same Amazon SQS message twice
+shouldn’t result in a second email notification. For a further explanation
+of Idempotency (with cows instead of Amazon SQS messages), take a look
+at the following video lesson of the REST API Tutorial project.
+For our use case, we could keep track of whom we already notified. For every
+incoming SQS message, we would check first if this collaboration request is new
+and otherwise drop the message as the person has already been informed. For
+our sample Todo application, we’ll live with the fact that we might send out the
+same invitation twice.
+As soon as we’re calling mailSender.send(), the email is handed over to
+Amazon SES. Now it’s the responsibility of AWS to deliver that email. Whenever
+we dispatch emails from our application, it’s crucial to monitor our delivery
+rates. It’s not unlikely that other email servers might reject our messages or
+mark them as spam. That’s something we’ll pick up in the chapter Metrics with
+Amazon CloudWatch.
+Once the invited person receives our email and clicks on the invitation link, it’s
+12. Sharing Todos with Amazon SQS and Amazon SES 280
+our area of responsibility again. Let’s see how our Spring Boot backend handles
+these confirmations in the following section.
+Accepting Confirmations
+The link we include inside the invitation email has the following structure:
+<domain>/todo/{todoId}/collaborations/{collaboratorId}/confirm?token={token}
+It targets an endpoint of our Spring Boot backend to confirm the collaboration.
+This endpoint requires authentication and hence the collaborator needs to be
+logged in. With this additional layer of security, we ensure that only the invited
+person can confirm the collaboration.
+The following Spring MVC endpoint handles the confirmation part of the col-
+laboration feature:
+@Controller
+@RequestMapping("/todo")
+public class TodoCollaborationController {
+// ... existing endpoint to create a collaboration
+@GetMapping("/{todoId}/collaborations/{collaboratorId}/confirm")
+public String confirmCollaboration(
+@PathVariable("todoId") Long todoId,
+@PathVariable("collaboratorId") Long collaboratorId,
+@RequestParam("token") String token,
+@AuthenticationPrincipal OidcUser user,
+RedirectAttributes redirectAttributes
+) {
+if(todoCollaborationService
+.confirmCollaboration(user.getEmail(), todoId, collaboratorId, token)) {
+redirectAttributes.addFlashAttribute("message"
+,
+"You've confirmed that you'd like to collaborate on this todo.");
+redirectAttributes.addFlashAttribute("messageType"
+,
+"success");
+12. Sharing Todos with Amazon SQS and Amazon SES 281
+}else {
+redirectAttributes.addFlashAttribute("message"
+,
+"Invalid collaboration request.");
+redirectAttributes.addFlashAttribute("messageType"
+,
+"danger");
+}
+return "redirect:/dashboard";
+}
+}
+As part of the confirmCollaboration() method of the TodoCollabora-
+tionService, we either confirm the collaboration or reject it:
+public class TodoCollaborationService {
+// other methods and fields
+public boolean confirmCollaboration(String authenticatedUserEmail,
+Long todoId, Long collaboratorId, String token) {
+Person collaborator = personRepository
+.findByEmail(authenticatedUserEmail)
+.orElseThrow(() -> new IllegalArgumentException());
+if (!collaborator.getId().equals(collaboratorId)) {
+return false;
+}
+TodoCollaborationRequest collaborationRequest = collaborationRequestRepository
+.findByTodoIdAndCollaboratorId(todoId, collaboratorId);
+if (collaborationRequest == null ||
+!collaborationRequest.getToken().equals(token)) {
+return false;
+}
+Todo todo = todoRepository
+.findById(todoId)
+.orElseThrow(() -> new IllegalArgumentException());
+todo.addCollaborator(collaborator);
+12. Sharing Todos with Amazon SQS and Amazon SES 282
+collaborationRequestRepository.delete(collaborationRequest);
+return true;
+}
+}
+We reject the confirmation for one of the following reasons:
+• the logged-in user tries to confirm a collaboration request for another user,
+• no collaboration request for this todo and/or user exists, or
+• the confirmation token is invalid.
+Depending on the outcome of the confirmation process, we return a boolean
+value to display either a success or error message to the user.
+We’re registering the invited user as a collaborator for the todo when call-
+ing todo.addCollaborator(collaborator). We’ve modeled this relationship
+with @ManyToMany as a todo can have multiple collaborators, and one person can
+collaborate on numerous todos:
+@Entity
+public class Todo {
+// ... more fields
+@ManyToMany
+@JoinTable(name = "todo_collaboration"
+,
+joinColumns = @JoinColumn(name = "todo_id"),
+inverseJoinColumns = @JoinColumn(name = "collaborator_id")
+)
+private List<Person> collaborators = new ArrayList<>();
+public void addCollaborator(Person person) {
+this.collaborators.add(person);
+person.getCollaborativeTodos().add(this);
+}
+}
+12. Sharing Todos with Amazon SQS and Amazon SES 283
+As this confirmCollaboration() method runs within a transaction, Hibernate
+will determine the necessary SQL statements with its dirty-checking mecha-
+nism, and we don’t have to explicitly call save() to persist this change.
+As an additional housekeeping task, we’re removing this particular collabora-
+tion request from our database as we no longer have to keep track of it.
+Once the invited person successfully confirms the collaboration, we’ll inform
+the todo owner with a push notification. We’re going to implement this feature
+in the upcoming chapter Push Notifications with Amazon MQ.
+Enabling Local Development
+What’s left is to update our local development setup. We’re integrating two new
+AWS services to our existing tech stack with the collaboration feature: Amazon
+SQS and Amazon SES. When developing and starting the application locally, we
+need access to both AWS services.
+As already outlined in the chapter Local Development, we’re using Docker and
+LocalStack to simulate a local AWS cloud. To that end, we’re extending our
+existing docker-compose.yml file with a new service definition:
+12. Sharing Todos with Amazon SQS and Amazon SES 284
+version: '3.3'
+services:
+# ... existing Docker container definitions
+localstack:
+image: localstack/localstack:0.14.4
+ports:
+- 4566:4566
+environment:
+- SERVICES=sqs,ses
+- DEFAULT_REGION=eu-central-1
+- USE_SINGLE_REGION=true
+volumes:
+- ./src/test/resources/localstack/local-aws-infrastructure.sh:\
+/docker-entrypoint-initaws.d/init.sh
+As part of the Docker container definition, we’re instructing LocalStack which
+AWS services to start using the SERVICES environment variable. Furthermore,
+we define the default AWS region. There’s no need to configure any specific
+credentials for our AWS SDK clients as LocalStack permits the use of any
+credentials.
+To initialize and set up our local AWS cloud, we mount a script inside the Docker
+container (local-aws-infrastructure.sh). LocalStack will run any script in-
+side the docker-entrypoint-initaws.d folder during container initialization.
+As part of our initialization script, we’re creating our Amazon SQS queue and
+verify several email identities for Amazon SES:
+12. Sharing Todos with Amazon SQS and Amazon SES 285
+#!/bin/sh
+awslocal sqs create-queue --queue-name stratospheric-todo-sharing
+awslocal ses verify-email-identity --email-address noreply@stratospheric.dev
+awslocal ses verify-email-identity --email-address info@stratospheric.dev
+awslocal ses verify-email-identity --email-address tom@stratospheric.dev
+awslocal ses verify-email-identity --email-address bjoern@stratospheric.dev
+awslocal ses verify-email-identity --email-address philip@stratospheric.dev
+The awslocal CLI tool is a wrapper for the aws binary that targets LocalStack
+instead of the real AWS cloud.
+Starting with LocalStack version v0.11.0, all AWS services are accessible
+via a single edge service on port 4566. With previous versions of Local-
+Stack, each AWS service allocated a dedicated port.
+Having the LocalStack container up and running, we need to configure our
+application’s AWS SDK clients to point to our local AWS cloud. We achieve this
+by overriding the endpoint URLs as part of our application-dev.yml:
+spring:
+cloud:
+aws:
+endpoint: http://localhost:4566
+region:
+static: eu-central-1
+credentials:
+secret-key: foo
+access-key: bar
+With this configuration, the auto-configured AWS SDK clients point to Local-
+Stack.
+There’s one caveat with LocalStack’s Amazon SES service. It won’t send any
+email to the collaborator’s inbox. LocalStack acts as a sandbox and will store
+12. Sharing Todos with Amazon SQS and Amazon SES 286
+the received emails in memory. Nevertheless, our application will receive a
+successful response whenever we use Spring’s MailSender.
+To make the entire collaboration journey work, we can auto-confirm
+collaborations locally. With a boolean property like custom.auto-confirm-
+collaborations, we can control this behavior. For all applications profiles
+except dev this value is set to false. Our TodoSharingListener checks for this
+property at the end of the processing:
+@Component
+public class TodoSharingListener {
+// ...
+private final boolean autoConfirmCollaborations;
+public TodoSharingListener(
+@Value("${custom.auto-confirm-collaborations}")
+boolean autoConfirmCollaborations) {
+this.autoConfirmCollaborations = autoConfirmCollaborations;
+}
+@SqsListener(value = "${custom.sharing-queue}", deletionPolicy = ON_SUCCESS)
+public void listenToSharingMessages(TodoCollaborationNotification payload) {
+// ...
+if (autoConfirmCollaborations) {
+LOG.info("Auto-confirm collaboration request");
+todoCollaborationService.confirmCollaboration(
+payload.getCollaboratorEmail(), payload.getTodoId(),
+payload.getCollaboratorId(), payload.getToken());
+}
+}
+}
+The LocalStack Amazon SQS service works just as expected: We’re able to
+publish and consume SQS messages when running our application locally.

@@ -1,0 +1,22 @@
+{
+  "groups": [
+    {
+      "name": "custom",
+      "type": "dev.todoapp.config.CustomConfigurationProperties",
+      "sourceType": "dev.todoapp.config.CustomConfigurationProperties"
+    }
+  ],
+  "properties": [
+    {
+      "name": "custom.invitation-codes",
+      "type": "java.util.Set<java.lang.String>",
+      "sourceType": "dev.todoapp.config.CustomConfigurationProperties"
+    },
+    {
+      "name": "custom.use-cognito-as-identity-provider",
+      "type": "java.lang.Boolean",
+      "sourceType": "dev.todoapp.config.CustomConfigurationProperties"
+    }
+  ],
+  "hints": []
+}

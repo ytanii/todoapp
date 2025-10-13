@@ -1,0 +1,94 @@
+{
+  "realm": "stratospheric",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "clients": [
+    {
+      "clientId": "spring-boot-application",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "m4x9aF8OE8xOzwFcRuFCoVQRg39HrGys",
+      "redirectUris": [
+        "http://localhost:8080/login/oauth2/code/cognito"
+      ],
+      "webOrigins": [
+        "http://localhost:8080"
+      ],
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "publicClient": false,
+      "frontchannelLogout": false,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true,
+      "nodeReRegistrationTimeout": -1,
+      "defaultClientScopes": [
+        "web-origins",
+        "role_list", 
+        "profile",
+        "roles",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access",
+        "microprofile-jwt"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "tom",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Tom",
+      "lastName": "Hombergs", 
+      "email": "tom@stratospheric.dev",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "stratospheric",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "bjoern",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Bjoern",
+      "lastName": "Wilmsmann",
+      "email": "bjoern@stratospheric.dev", 
+      "credentials": [
+        {
+          "type": "password",
+          "value": "stratospheric",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "philip",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Philip",
+      "lastName": "Riecks",
+      "email": "philip@stratospheric.dev",
+      "credentials": [
+        {
+          "type": "password", 
+          "value": "stratospheric",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1243 @@
+10. Building User Registration and Login
+with Amazon Cognito
+With this chapter, we’re adding the first features to our Todo application:
+user registration and login. Managing user pools is a common task of every
+enterprise application. Whenever we deal with such security concerns, we’re
+usually better off using an off-the-shelf solution rather than reinventing the
+wheel.
+To take this sensitive task off our hands, we chose an AWS service that we can
+seamlessly integrate with our Spring Boot application.
+Before we jump right into configuring our Todo application, we’ll first discuss
+important terminology and the formal specifications (OAuth 2.0 & OpenID
+Connect 1.0) that make all of this work.
+All upcoming code examples are part of the chapters/chapter10 project folder
+on GitHub.
+What’s OAuth2?
+OAuth 2.0 (Open Authorization) is …
+“… the industry-standard protocol for authorization. OAuth 2.0 fo-
+cuses on client developer simplicity while providing specific authoriza-
+tion flows for web applications, desktop applications, mobile phones,
+and living room devices.”
+10. Building User Registration and Login with Amazon Cognito 182
+While authentication is the process of verifying someone’s identity (for
+example by validating credentials), authorization is about determining
+which level of access a user has for specific resources or operations (for
+example only admin users are allowed to create new users).
+This standard currently exists in two versions: OAuth 1.0 and OAuth 2.0. Both
+address the same idea, but version 2 simplifies the integration and offers more
+flexibility. An in-depth comparison of both versions is available on the OAuth
+2.0 Simplified blog.
+As this book’s focus is on Spring Boot and AWS, we’ll only cover the parts of
+OAuth that are required to understand the integration between our app and
+Amazon Cognito. There are excellent resources available online to dive deeper
+into the topic. Marco Behler, for example, has put together a comprehensive
+guide that focuses on OAuth 2.0 and Spring Security.
+Most of us probably have seen OAuth 2.0 in action at some point in time when
+using modern SaaS applications. Often, it’s used behind the scenes when we
+grant access to a third-party application’s resources or operations.
+A good example is the CI/CD platform Travis CI, which we can use to build and
+deploy code from our GitHub projects. After signing up for a Travis CI account,
+we are asked to grant Travis access to our GitHub repositories for Travis to build
+our projects on every push. For this to work, we’ll be redirected to GitHub, where
+we then have to enter our GitHub credentials. Afterwards, we have to confirm
+that we’ll be granting Travis CI access to a set of operations/information that
+Travis CI can now perform on our behalf. Once granted, we’ll see our GitHub
+projects popping up in the Travis web interface.
+To understand how the scenario we just described works without giving Travis
+access to our GitHub credentials (which would be a significant security flaw), we
+first have to define and explain some OAuth 2.0 terms.
+10. Building User Registration and Login with Amazon Cognito 183
+OAuth 2.0 Terminology
+The OAuth 2.0 protocol defines four roles:
+• Resource Owner: Typically an end user (us) that owns resources in a third-
+party application (e.g., repositories on GitHub).
+• Resource Server: Most of the time, a server (GitHub’s API) that exposes
+protected resources.
+• Client: An application (e.g., Travis CI) that wants access to protected re-
+sources on behalf of the Resource Owner.
+• Authorization Server: A server that authenticates the Resource Owner (end
+user) and issues access tokens after obtaining authorization.
+How a Client gets a valid access token to request protected resources of a Resource
+Owner depends on the use case and the application’s architecture. OAuth2.0
+defines different workflows (so-called “grant types”) on how an application
+can access protected resources. The most commonly used grant types are the
+following:
+• Authorization Code: Most commonly used for web and mobile applications.
+Requires launching a browser to begin the flow.
+• Client Credentials: Suitable for server-to-server communication without
+user interaction.
+• Device Code: Used by input-constrained devices (e.g., smart TV sets) to
+request an access token.
+• Refresh Token: The client can frequently exchange the refresh token for a
+new access token without requiring the user to be redirected each time the
+access token expires.
+10. Building User Registration and Login with Amazon Cognito 184
+In our Travis example, we’ve used the Authorization Code grant to allow access
+to our GitHub repositories. Travis needs a valid access token to access GitHub’s
+APIs and retrieve information about our GitHub repositories. Using the Autho-
+rization Code grant, the procedure works like this on a high level:
+1. The application (the Client, Travis in this case) sends us (the Resource Owner)
+to the Authorization Server (GitHub’s login page).
+2. The Resource Owner (us) enters the credentials for the Authorization Server
+and approves the request to access data on their behalf.
+3. The user is redirected to the application (Travis) with an authorization code
+in the query string.
+4. The application (Travis) exchanges this authorization code for an access
+token to fetch data from the Resource Server (GitHub’s API).
+The following diagram visualizes this flow:
+10. Building User Registration and Login with Amazon Cognito 185
+OAuth 2.0 Authorization Code Grant Flow
+With the help of so-called “scopes” a client defines which operations and
+data it needs access to. While there are different operations and resources
+available on GitHub (e.g., “read profile”, “see public repositories”, “manage
+an organization”, …), Travis doesn’t require all of these. Defining a subset of
+scopes allows Travis to only perform those operations it requires.
+While OAuth 2.0 is all about authorization, can we somehow use these concepts
+to enable authentication? This is where OpenID Connect 1.0 comes into play.
+10. Building User Registration and Login with Amazon Cognito 186
+OpenID Connect 1.0 (OIDC)
+While OAuth 2.0 focuses on authorization (granting Travis CI access to your
+GitHub repositories), there is an additional protocol that builds on top of OAuth
+2.0 to solve authentication: OpenID Connect 1.0 (short OIDC).
+In a nutshell, OIDC is a …
+“… simple identity layer on top of the OAuth 2.0 protocol. It allows
+Clients to verify the identity of the End-User based on the authentica-
+tion performed by an Authorization Server, as well as to obtain basic
+profile information about the End-User in an interoperable and REST-
+like manner.”
+With OIDC, the end user entity now becomes the protected resource instead
+of our GitHub repositories or Gmail contacts, for instance. This authentication
+mechanism works with several OAuth 2.0 grant types, Authorization Code being
+the one that is most commonly used.
+The process is similar to what we already described for the Travis CI and GitHub
+example. The main difference is that the client (our application) is now called
+the “Relying Party” (RP). Furthermore, the scope openid is mandatory, and the
+end user becomes the protected resource our application requests access to.
+Whenever you see “Login with GitHub” or “Login with Google” on the login
+page of a particular website or app, that app or website is making use of this
+OpenID Connect protocol.
+For the following chapters, it’s enough to understand that OIDC is an identity
+layer on top of OAuth 2.0 that enables user login with a third-party account
+(e.g., Google, GitHub, Twitter). This frees us from having to implement user
+10. Building User Registration and Login with Amazon Cognito 187
+management ourselves. You can read through the official specification to get
+more information in greater detail.
+AWS provides the “Cognito” service, which implements the OAuth 2.0 and
+OpenID Connect specifications and which we’ll integrate into our sample ap-
+plication.
+Alternatives to OAuth2 & OpenID Connect
+As an alternative to OAuth2 and OIDC, our application could also implement
+its own user management. Spring Security provides a set of authentication
+mechanisms out-of-the-box: Basic Authentication, Form-based authentica-
+tion, etc. Moreover, the Spring team recently introduced the Authorization
+Server project.
+With all of those solutions, we would have to store sensitive information about
+our users (such as passwords) and provide features like password recovery or
+confirmation emails. That’s interesting to implement (at least once) but the
+additional maintenance effort and security concerns may not be worth it.
+As security is a crucial subject, we prefer experts to solve this for us. If neglected
+at the beginning of a project, adding security-related features in a rush right
+before going live is not beneficial. Having it solved at the beginning of a project
+brings peace of mind and improves our time-to-market as we can concentrate
+on our features.
+On the other hand, we now have an additional dependency that is crucial for our
+application to work: We’re relying on the uptime of the identity provider. Hence,
+our application would be unusable (at least its protected areas) whenever there
+is an outage.
+10. Building User Registration and Login with Amazon Cognito 188
+Using Amazon Cognito for User Management
+With the upcoming sections, we’ll learn more about Cognito, its vocabulary, and
+how to configure and integrate it with our Todo application.
+Introduction to Amazon Cognito
+Amazon Cognito is a managed service that provides authentication, autho-
+rization, and user management for web and mobile applications. It supports
+OAuth 2.0, OpenID Connect 1.0, and various other protocols. Using this service,
+we’ll delegate user management to AWS. This provides us with the following
+features:
+• secure and simple user management
+• pay-per-active-user model
+• social logins via Facebook, Google, etc.
+• optional multi-factor authentication
+• SDKs for various programming languages (Java, JavaScript, Python, etc.)
+• customizable web sign-in page
+Similar off-the-shelf solutions that we could use instead of Amazon Cognito
+are Okta, Keycloak, or Auth0.
+Let’s take a look at the terminology of Cognito.
+Amazon Cognito Terminology
+A User Pool acts as a user directory where we can store and manage user
+information. Each User Pool comes with sign-up and sign-in functionality. This
+10. Building User Registration and Login with Amazon Cognito 189
+includes a web interface to sign in that we can customize and configure, for
+example with additional social logins (Google, GitHub, etc.) or multi-factor
+authentication.
+We’ll create a single User Pool for our application and store all our users there.
+It’s not required to have a separate User Pool per application as we might want
+to log in with the same credentials across multiple applications.
+As part of the User Pool, we can also configure our password policy, define
+required and optional user attributes, enable password recovery mechanisms,
+and customize the email notifications.
+A User Pool App Client is associated with a User Pool and has permission to call
+unauthenticated API operations like signing in or registering users. Therefore,
+every App Client requires a client ID and an optional secret.
+As part of creating the App Client, we configure the valid callback/logout URLs
+and define which OAuth 2.0 flows and scopes this client can use. We’ll register
+our Todo application as a User Pool App Client to enable user login via OIDC and
+the OAuth 2.0 Authorization Code Grant flow.
+With an Identity Pool, we can map a user from an Identity Provider to an IAM
+role. This allows us to give users access to AWS resources based on their IAM
+permissions. Since the users of our Todo app don’t need IAM roles to use the
+app, an Identity Pool is not relevant for us.
+For an in-depth comparison of Identity Pools and User Pools take a look at
+Jake Bennett’s blog post Understanding Amazon Cognito User and Identity Pools
+for Serverless Apps. Not only does this article explain their difference but also
+showcases how we could use both concepts together.
+Like all other AWS resources that we provide for our application, we prefer
+infrastructure-as-code over repetitive manual efforts in the AWS Console.
+10. Building User Registration and Login with Amazon Cognito 190
+Let’s see how we can create our Cognito resources with CDK.
+The Amazon Cognito CDK App
+As per our convention from the chapter Designing a Deployment Project with CDK,
+we’ll create a new CDK app for our Cognito instance:
+public class CognitoApp {
+public static void main(final String[] args) {
+App app = new App();
+// omitted standard configuration values like the AWS region and sanity checks
+String applicationUrl = (String) app
+.getNode()
+.tryGetContext("applicationUrl");
+String loginPageDomainPrefix = (String) app
+.getNode()
+.tryGetContext("loginPageDomainPrefix");
+Environment awsEnvironment = makeEnv(accountId, region);
+ApplicationEnvironment applicationEnvironment = new ApplicationEnvironment(
+applicationName,
+environmentName
+);
+new CognitoStack(
+app,
+"cognito"
+,
+awsEnvironment,
+applicationEnvironment,
+new CognitoStack.CognitoInputParameters(
+applicationName,
+applicationUrl,
+loginPageDomainPrefix));
+app.synth();
+}
+10. Building User Registration and Login with Amazon Cognito 191
+}
+You can find the entire source code for the CognitoApp on GitHub.
+Apart from our standard input parameters (environmentName, application-
+Name, accountId, region), this CDK app depends on the following additional
+parameters:
+• applicationUrl: As part of configuring the UserPoolClient, we need to
+define the valid callback and logout URLs. This parameter allows us to
+pass the final base URL of our application. An example URL would be
+https://app.stratospheric.dev.
+• loginPageDomainPrefix: Each user pool provides a customizable web UI
+for users to log in. We can either provide a custom domain or pass a
+prefix to use an Amazon Cognito domain that will look something like this:
+https://<prefix>.auth.<region>.amazoncognito.com.
+For the upcoming stack definition, we include the AWS CDK Cognito module in
+our CDK project. The AWS CDK construct library already ships stable level 1 and
+level 2 constructs for User Pools:
+10. Building User Registration and Login with Amazon Cognito 192
+<!-- Both imports can be omitted when using cdk-constructs -->
+<dependency>
+<groupId>software.amazon.awscdk</groupId>
+<artifactId>aws-cdk-lib</artifactId>
+<version>${aws-cdk-lib.version}</version>
+</dependency>
+<dependency>
+<groupId>software.constructs</groupId>
+<artifactId>constructs</artifactId>
+<version>${constructs.version}</version>
+</dependency>
+Our AWS CDK CognitoStack defines three resources: a UserPool, one User-
+PoolClient, and a UserPoolDomain. Let’s start with the configuration of the
+UserPool.
+Creating the UserPool
+The UserPool acts as the user directory and is the first resource we create as
+part of our CognitoStack (see the code on GitHub):
+public class CognitoStack extends Stack {
+// fields omitted
+public CognitoStack(
+final Construct scope,
+final String id,
+final Environment awsEnvironment,
+final ApplicationEnvironment applicationEnvironment,
+final CognitoInputParameters inputParameters) {
+super(scope, id, StackProps.builder()
+.stackName(applicationEnvironment.prefix("Cognito"))
+.env(awsEnvironment).build());
+this.applicationEnvironment = applicationEnvironment;
+this.userPool = UserPool.Builder.create(this,
+"userPool")
+10. Building User Registration and Login with Amazon Cognito 193
+.userPoolName(inputParameters.applicationName + "-user-pool")
+.selfSignUpEnabled(false)
+.standardAttributes(StandardAttributes.builder()
+.email(StandardAttribute
+.builder()
+.required(true)
+.mutable(false)
+.build())
+.build())
+.signInAliases(SignInAliases
+.builder()
+.username(true)
+.email(true)
+.build())
+.signInCaseSensitive(true)
+.autoVerify(AutoVerifiedAttrs
+.builder()
+.email(true)
+.build())
+.mfa(Mfa.OFF)
+.accountRecovery(AccountRecovery.EMAIL_ONLY)
+.passwordPolicy(PasswordPolicy.builder()
+.requireLowercase(true)
+.requireDigits(true)
+.requireSymbols(true)
+.requireUppercase(true)
+.minLength(12)
+.tempPasswordValidity(Duration.days(7))
+.build())
+.build();
+// further Cognito-related resources
+}
+}
+In contrast to the approach of creating our own CDK Constructs that we
+followed in the chapter Designing a Deployment Project with CDK, we’re using a
+slightly different approach here: We’re creating a CDK Stack that composes
+official Cognito CDK level 2 constructs instead of our own building blocks. This
+10. Building User Registration and Login with Amazon Cognito 194
+gives us more flexibility as we’re able to fine-tune the highly customizable
+Cognito setup.
+Most of the attributes of this resource are self-explanatory. We disable self-
+SignUp to only allow admin users to add new users to our user pool. Otherwise,
+users would be able to register themselves.
+Our Todo application will act as such an admin and create our users. For this to
+work, we have to extend the IAM role for our ECS task and allow our application
+to perform all operations related to the identity provider.
+The Service construct of our cdk-constructs library now takes a list of Pol-
+icyStatement objects, which are needed for configuring the access to internal
+AWS resources for our application. We’ll add the following object to this list (see
+ServiceApp on GitHub) to allow all operations for cognito-idp:
+.withTaskRolePolicyStatements(List.of(
+PolicyStatement.Builder.create()
+.sid("AllowCreatingUsers")
+.effect(Effect.ALLOW)
+.resources(
+List.of(String.format("arn:aws:cognito-idp:%s:%s:userpool/%s", region,
+accountId, cognitoOutputParameters.getUserPoolId()))
+)
+.actions(List.of("cognito-idp:AdminCreateUser"))
+.build()
+))
+When working with IAM roles for Cognito, make sure to use cognito-idp
+as a prefix when targeting relevant actions for a User Pool. The
+cognito-identity prefix refers to Identity Pools.
+To keep the amount of user information to a minimum, we only require a
+username and email address during the sign-up process. The username is
+10. Building User Registration and Login with Amazon Cognito 195
+available by default. Hence, we don’t need to add it when configuring the
+standardAttributes.
+Users can use both their email and username to log in (signInAliases). Both
+are case-sensitive. We automatically approve the user’s email by adding email
+to the autoVerify attributes.
+Multi-factor authentication (MFA) is disabled as we set mfa to OFF. Users can
+only use their email to recover their accounts in case they forgot their passwords
+(accountRecovery).
+As the last step, we adjust the passwordPolicy to a solid security standard by
+requesting users to enter a password with at least twelve mixed (symbols, digits,
+uppercase, lowercase) characters.
+By default, this level 2 construct configures Amazon Cognito as the email
+delivery service (for sending the password or a recovery email, for example)
+instead of Amazon SES. However, with this setup, we have to keep in mind that
+Amazon Cognito comes with a daily email limit. We should use Amazon SES in
+the long run (as is the suggested best practice).
+Creating the UserPoolClient and UserPoolDomain
+Next, we add a UserPoolClient for our Todo application. If we had other clients
+that required access to Cognito (for example a mobile app) we would have to
+duplicate the configuration below and adjust the values:
+10. Building User Registration and Login with Amazon Cognito 196
+this.userPoolClient = UserPoolClient.Builder.create(this,
+.userPoolClientName(inputParameters.applicationName + "-client")
+.generateSecret(true)
+.userPool(this.userPool)
+.oAuth(OAuthSettings
+.builder()
+.callbackUrls(asList(
+String.format(
+"%s/login/oauth2/code/cognito"
+,
+inputParameters.applicationUrl),
+"http://localhost:8080/login/oauth2/code/cognito"
+"userPoolClient")
+))
+.logoutUrls(asList(
+inputParameters.applicationUrl,
+"http://localhost:8080"))
+.flows(OAuthFlows
+.builder()
+.authorizationCodeGrant(true)
+.build())
+.scopes(asList(
+OAuthScope.EMAIL,
+OAuthScope.OPENID,
+OAuthScope.PROFILE))
+.build())
+.supportedIdentityProviders(singletonList(
+UserPoolClientIdentityProvider.COGNITO))
+.build();
+We define the client’s name (userPoolClientName) to avoid random client
+names. For security reasons, AWS generates the secret for this client for us
+(generateSecret). Afterwards, we can use the Cognito SDK to retrieve this auto-
+generated value.
+By setting userPool to the Java object that was returned when creating the
+UserPool we connect this client to our User Pool.
+Next, for both the callback and logout URLs, we’re adding two URLs. One URL
+is the final production URL, while the other one is used for local development
+and troubleshooting. The path /login/oauth2/code/cognito is the standard
+10. Building User Registration and Login with Amazon Cognito 197
+callback URI for Spring Security.
+With the remaining attributes, we allow this user pool client to use the OAuth
+2.0 Authorization Code Grant flow with a pre-defined set of OAuth 2.0 scopes.
+The supportedIdentityProviders() method expects a list of identity
+providers that our users can use to sign with this client. Apart from COGNITO,
+we could add FACEBOOK, AMAZON, GOOGLE, or a custom identity provider here.
+The last resource of this stack is the UserPoolDomain:
+this.userPoolDomain = UserPoolDomain.Builder.create(this,
+.userPool(this.userPool)
+.cognitoDomain(CognitoDomainOptions
+.builder()
+.domainPrefix(inputParameters.loginPageDomainPrefix)
+.build())
+.build();
+"userPoolDomain")
+As we are not using a custom domain for the sign-in page, we’re configuring
+the prefix for the Amazon Cognito domain. If we deploy this stack to the region
+eu-central-1 and use “stratospheric” as the LoginPageDomainPrefix, we will
+get the following sign-in URL: https://stratospheric.auth.eu-central-1-
+amazoncognito.com.
+We could also re-use the applicationName input parameter as the domain
+prefix, but we would have to ensure that this prefix is unique for the AWS region.
+The additional parameter gives us the flexibility to pick another prefix if the
+application name is already taken.
+Amazon Cognito Output Parameters
+To configure Spring Security for our Todo application later on, we need to expose
+our Cognito setup’s dynamic attributes:
+10. Building User Registration and Login with Amazon Cognito 198
+StringParameter.Builder.create(this,
+"userPoolId")
+.parameterName(createParameterName(
+applicationEnvironment,
+PARAMETER_USER_POOL_ID))
+.stringValue(this.userPool.getUserPoolId())
+.build();
+StringParameter.Builder.create(this,
+"userPoolClientId")
+.parameterName(createParameterName(
+applicationEnvironment,
+PARAMETER_USER_POOL_CLIENT_ID))
+.stringValue(this.userPoolClient.getUserPoolClientId())
+.build();
+StringParameter.Builder.create(this,
+.parameterName(createParameterName(
+applicationEnvironment,
+PARAMETER_USER_POOL_LOGOUT_URL))
+.stringValue(this.logoutUrl)
+.build();
+"logoutUrl")
+StringParameter.Builder.create(this,
+"providerUrl")
+.parameterName(createParameterName(
+applicationEnvironment,
+PARAMETER_USER_POOL_PROVIDER_URL))
+.stringValue(this.userPool.getUserPoolProviderUrl())
+.build();
+AWS generates random values for both the userPoolId and userPoolClientId.
+We need to expose both IDs to later fetch the secret of the OAuth 2 client.
+The logoutUrl is required for fully logging out the end user. More about this
+at the end of this chapter. This URL contains our loginDomainPrefix and the
+AWS region, which will look something like this:
+https://stratospheric.auth.eu-central-1.amazoncognito.com/logout
+We need to expose the providerUrl to configure Spring Security to discover the
+OAuth 2.0 relevant endpoints. This URL contains the AWS region and our user
+pool identifier and will look like this:
+10. Building User Registration and Login with Amazon Cognito 199
+https://cognito-idp.eu-central-1.amazonaws.com/eu-central-1_pD8flsXa
+To retrieve this auto-generated secret, we call the getUserPoolClientSe-
+cret() method of our UserPoolClient. We then unwrap the secret value
+returned by that method into a string, which we then store inside the AWS
+Parameter Store:
+this.userPoolClientSecret = this.userPoolClient.getUserPoolClientSecret().unsafeUnwr\
+ap();
+StringParameter userPoolClientSecret =
+StringParameter.Builder.create(this,
+.parameterName(createParameterName(
+applicationEnvironment,
+PARAMETER_USER_POOL_CLIENT_SECRET))
+.stringValue(this.userPoolClientSecret)
+.build();
+"userPoolClientSecret")
+In summary, we need the following output values to integrate our application
+with Cognito properly:
+• User Pool provider URL
+• User Pool logout URL
+• User Pool client name
+• User Pool client ID
+• User Pool client secret
+As our Spring Boot application expects these values on application startup,
+we have to deploy or update the Cognito stack before triggering a new ECS
+deployment of our Todo app.
+Finally, we extend our package.json with two scripts to conveniently create,
+update, or destroy the Cognito CDK app:
+10. Building User Registration and Login with Amazon Cognito 200
+npm run cognito:deploy
+npm run cognito:destroy
+A Note on Secure Parameters
+You might notice that we stored the userPoolClientSecret parameter as
+a plain StringParameter in the AWS Parameter Store, meaning it’s not en-
+crypted as a secret. Later, in the chapter Connecting to a Database with RDS, we
+will see how to store and retrieve an encrypted secret in AWS Secrets Manager.
+By itself, this encryption isn’t worth much, however, since we’ll be passing all
+secrets as plain-text environment variables into the Docker container with our
+Spring Boot application. That means they will be available in plain text during
+runtime. Also, all environment variables are displayed in plain text in the ECS
+web console.
+Another option to handle secret parameters is to store them as secrets in AWS
+Secrets Manager and just inject the name of the parameter as an environment
+variable into our application. The application can then use the parameter name
+to load the secret from the secret store when it needs it. This way, the parameter
+wouldn’t be accessible as an environment variable during the entire runtime of
+the application. It would only be accessible for admins with permissions to the
+Secrets Manager.
+Spring AWS integrates the AWS Secrets Manager to make secrets available as
+application properties. We opted for simplicity over security in this case and
+used a plain environment variable for the Cognito user pool client secret.
+As an alternative, we could also store sensitive configuration values as Secure-
+Strings inside the AWS Parameter Store and use Spring Cloud AWS to fetch the
+values upon application start.
+10. Building User Registration and Login with Amazon Cognito 201
+Using Amazon Cognito as an Identity Provider With Spring
+Security
+Now, let’s see how we can integrate the Cognito User Pool and Client with our
+Spring Boot application.
+Spring Security already supports both OAuth 2.0 and OpenID Connect 1.0 out-
+of-the-box. As we’re building on top of an industry-standard protocol there’s
+a common procedure happening behind the scenes that Spring Security imple-
+ments for us.
+The relevant security components are part of the following two Spring Boot
+starters:
+dependencies {
+implementation 'org.springframework.boot:spring-boot-starter-security'
+implementation 'org.springframework.boot:spring-boot-starter-oauth2-client'
+}
+These starters already do a lot of configuration work for us. What’s left is
+to configure information about the OpenID Connect 1.0 Provider - which is
+Cognito in our case.
+Spring Security needs to know a set of URIs about the external provider - the
+authorization-uri, token-uri , user-info-uri, etc. - to perform the OAuth
+2.0 Authorization Code Grant flow. While we could specify all of these attributes
+on our own, there is an even simpler solution available.
+The OpenID Connect specification requires every compatible provider to expose
+a discovery endpoint for retrieving configuration values. This endpoint must
+be available at the following specified path: FULL_URI_OF_THE_PROVDER/.well-
+known/openid-configuration.
+10. Building User Registration and Login with Amazon Cognito 202
+When invoking this endpoint (via an HTTP GET request) for our Cognito user
+pool we get the following result:
+curl -v https://cognito-idp.eu-central-1.amazonaws.com/eu-
+central-1_pXOUNokLO/.well-known/openid-configuration
+{
+"authorization_endpoint": "https://dev101...amazoncognito.com/oauth2/authorize",
+"id_token_signing_alg_values_supported": [
+"RS256"
+],
+"issuer": "https://...amazonaws.com/eu-central-1_pXOUNokLO",
+"jwks_uri": "https:/...amazonaws.com/eu-central-1_pXOUNokLO/.well-known/jwks.json",
+"response_types_supported": [
+"code",
+"token"
+],
+"scopes_supported": [
+"openid",
+"email",
+"phone",
+"profile"
+],
+"subject_types_supported": [
+"public"
+],
+"token_endpoint": "https://...amazoncognito.com/oauth2/token",
+"token_endpoint_auth_methods_supported": [
+"client_secret_basic",
+"client_secret_post"
+],
+"userinfo_endpoint": "https://...amazoncognito.com/oauth2/userInfo"
+}
+By specifying the OpenID Discovery endpoint of our identity provider, Spring
+Security automatically retrieves all relevant information on application startup.
+Putting it all together, the relevant Spring Security configuration in our
+application-aws.yml file will look like this:
+10. Building User Registration and Login with Amazon Cognito 203
+spring:
+security:
+oauth2:
+client:
+registration:
+cognito:
+clientId: ${COGNITO_CLIENT_ID}
+clientSecret: ${COGNITO_CLIENT_SECRET}
+scope: openid, profile, email
+clientName: stratospheric-client
+provider:
+cognito:
+issuerUri: ${COGNITO_PROVIDER_URL}
+The ${} placeholders will be replaced with environment variables that we
+specify when deploying our Todo application with ECS (using SpEL - Spring’s
+powerful expression language).
+User Registration with Amazon Cognito
+An empty User Pool is good for our AWS bill but not for our application’s
+reputation. It’s time to fill it with actual users of our Todo application.
+While configuring the Cognito User Pool we specified that only admin users are
+allowed to add new users to the pool.
+For communicating with Cognito we’re using the Java SDK. To align all AWS Java
+SDK versions Spring Cloud AWS already specifies the AWS Java SDK BOM. Hence,
+we only have to add the following dependency to our project without specifying
+a version:
+10. Building User Registration and Login with Amazon Cognito 204
+dependencies {
+implementation 'software.amazon.awssdk:cognitoidentityprovider'
+}
+Next, we define a Spring Bean of type CognitoIdentityProviderClient as this
+client is not auto-configured by Spring Cloud AWS for us:
+@Configuration
+public class AwsConfig {
+@Bean
+@ConditionalOnProperty(prefix = "custom"
+,
+name = "use-cognito-as-identity-provider", havingValue = "true")
+public CognitoIdentityProviderClient cognitoIdentityProviderClient(
+AwsRegionProvider regionProvider,
+AwsCredentialsProvider awsCredentialsProvider) {
+return CognitoIdentityProviderClient.builder()
+.credentialsProvider(awsCredentialsProvider)
+.region(regionProvider.getRegion())
+.build();
+}
+}
+As outlined in the chapter Local Development, we don’t want to connect to the
+real Cognito service when we’re working locally, so this Spring bean will not be
+activated if our custom property use-cognito-as-identity-provider is set to
+false.
+Our users will be able to register their accounts as part of the Todo application.
+To avoid bots from auto-generating accounts, we add a layer of protection and
+require an invitation code on each signup. To that end, let’s create a public
+Thymeleaf view that contains the relevant information for new sign-ups.
+The model for our view contains the following information:
+10. Building User Registration and Login with Amazon Cognito 205
+public class Registration {
+@NotBlank
+private String username;
+@Email
+private String email;
+@ValidInvitationCode
+private String invitationCode;
+// getters & setters
+}
+We’re using Bean Validation to validate the incoming data on form submit. A
+basic Spring MVC controller endpoint exposes this view and instantiates an
+empty Registration object to be filled by the user:
+@Controller
+@RequestMapping("/register")
+public class RegistrationController {
+private final RegistrationService registrationService;
+public RegistrationController(RegistrationService registrationService) {
+this.registrationService = registrationService;
+}
+@GetMapping
+public String getRegisterView(Model model) {
+model.addAttribute("registration"
+return "register";
+, new Registration());
+}
+}
+The relevant Thymeleaf part for the HTML form binds the model attributes to
+input fields and displays an error message whenever the validation fails:
+10. Building User Registration and Login with Amazon Cognito 206
+<form th:action="@{/register}" th:object="${registration}" method="post">
+<div class="form-group">
+<label for="username">Username</label>
+<input
+type="text"
+th:field="*{username}"
+class="form-control"
+id="username"
+required>
+</div>
+<div class="form-group">
+<label for="email">Email address</label>
+<input
+type="email"
+th:field="*{email}"
+class="form-control"
+id="email"
+required
+aria-describedby="emailHelp">
+<small id="emailHelp" class="form-text text-muted">
+We'll never share your email with anyone else.
+</small>
+</div>
+<div class="form-group">
+<label for="invitationCode">Invitation code</label>
+<input
+th:field="*{invitationCode}"
+th:classappend="${#fields.hasErrors('invitationCode')}? 'is-invalid'"
+type="text"
+class="form-control"
+id="invitationCode"
+aria-describedby="invitationCodeHelp"
+required>
+<div th:if="${#fields.hasErrors('invitationCode')}"
+th:text="${#strings.listJoin(#fields.errors('invitationCode'), ', ')}"
+class="invalid-feedback">
+</div>
+<small id="invitationCodeHelp" class="form-text text-muted">
+Enter the invitation code you received to register.
+</small>
+</div>
+<button type="submit" class="btn btn-primary">Submit</button>
+</form>
+10. Building User Registration and Login with Amazon Cognito 207
+We won’t go into much detail about Thymeleaf and explain every bit
+of our views as the main subject of this book is AWS and Spring Boot.
+If you are looking for an excellent resource on developing Spring Boot
+applications with Thymeleaf, we highly recommend Wim Deblauwe’s
+Taming Thymeleaf book.
+Our users will see the following registration page:
+Stratospheric registration page.
+For validating the submitted invitation code, we’re defining a custom Con-
+straintValidator that checks the code against a set of valid invitation codes
+(see InvitationCodeValidator on GitHub). We can configure these codes with
+an environment variable or store it in the AWS SSM Parameter Store.
+10. Building User Registration and Login with Amazon Cognito 208
+Whenever the user hits the submit button, the browser performs an HTTP POST
+against /register and includes the registration information as payload.
+To be able to process this request, we have to add a new endpoint mapping to
+our RegistrationController:
+@PostMapping
+public String registerUser(
+@Valid Registration registration,
+BindingResult bindingResult,
+Model model, RedirectAttributes redirectAttributes) {
+if (bindingResult.hasErrors()) {
+model.addAttribute("registration", registration);
+return "register";
+}
+try {
+registrationService.registerUser(registration);
+redirectAttributes.addFlashAttribute("message"
+,
+"You successfully registered for the Todo App. " +
+"Please check your email inbox for further instructions."
+);
+redirectAttributes.addFlashAttribute("messageType"
+,
+"success");
+return "redirect:/";
+} catch (CognitoIdentityProviderException exception) {
+model.addAttribute("registration", registration);
+model.addAttribute("message", exception.getMessage());
+model.addAttribute("messageType"
+,
+"danger");
+return "register";
+}
+}
+First, we ensure that our model matches our validation rules (e.g., no empty
+email or username). Even though we also have some basic client-side validation
+for them, we never know how clients reach our endpoint and hence should
+always validate the payload.
+10. Building User Registration and Login with Amazon Cognito 209
+If there are validation errors, bindingResult.hasErrors() call returns true,
+and we are displaying the registration page to the user again with additional
+hints. For example, this might happen if a user enters the wrong validation
+code.
+Stratospheric registration page with binding error.
+We delegate the actual registration to the RegistrationService and pass the
+submitted values. Our RegistrationService is an interface as we’ll have two
+flavors of it depending on which environment our application runs in:
+10. Building User Registration and Login with Amazon Cognito 210
+public interface RegistrationService {
+void registerUser(Registration registration);
+}
+For the production runtime on AWS, we’ll create a new user as part of our
+Cognito User Pool:
+@Service
+@ConditionalOnProperty(prefix = "custom"
+,
+name = "use-cognito-as-identity-provider", havingValue = "true")
+public class CognitoRegistrationService implements RegistrationService {
+private final CognitoIdentityProviderClient cognitoIdentityProviderClient;
+private final String userPooldId;
+public CognitoRegistrationService(
+CognitoIdentityProviderClient cognitoIdentityProviderClient,
+@Value("${COGNITO_USER_POOL_ID}") String userPoolId) {
+this.cognitoIdentityProviderClient = cognitoIdentityProviderClient;
+this.userPooldId = userPoolId;
+}
+@Override
+public void registerUser(Registration registration) {
+AdminCreateUserRequest registrationRequest = new AdminCreateUserRequest()
+.withUserPoolId(userPooldId)
+.withUsername(registration.getUsername())
+.withUserAttributes(
+new AttributeType()
+.withName("email")
+.withValue(registration.getEmail()),
+new AttributeType()
+.withName("email_verified")
+.withValue("true")
+)
+.withDesiredDeliveryMediums(DeliveryMediumType.EMAIL)
+.withForceAliasCreation(Boolean.FALSE);
+cognitoIdentityProviderClient.adminCreateUser(registrationRequest);
+}
+}
+10. Building User Registration and Login with Amazon Cognito 211
+The Amazon Cognito Java SDK provides the relevant classes for performing
+an AdminCreateUserRequest. There isn’t much data we pass alongside the
+registration, as we only require a username and an email from the user.
+Up until now, the user did not select any password. That’s because we config-
+ured our Cognito User Pool to send a temporary password upon registration to
+the user’s inbox.
+Login with Amazon Cognito
+Right now, all endpoints of our application are protected by the auto-
+configuration of Spring Security. Our Todo application should have both a
+protected and public area, though. Only logged-in users should be allowed to
+create, edit, delete, and share todos.
+However, the previous view for the registration process has to be available
+without any authentication. Furthermore, the landing page of our application
+and the /health endpoint have similar requirements. The same is true of any
+static resource (JavaScript, CSS, etc.) that our Spring Boot application serves to
+the browser.
+Any other part of the application should be protected and only accessible for
+users who logged in via OIDC and their Cognito credentials.
+Let’s see how we can configure our application to meet these requirements.
+Spring Security allows us to define our own security rules by providing a Secu-
+rityFilterChain bean. We can inject the application’s HttpSecurity instance
+to specify our security restrictions using a fluent builder:
+10. Building User Registration and Login with Amazon Cognito 212
+@Configuration
+public class WebSecurityConfig {
+@Bean
+public SecurityFilterChain securityFilterChain(HttpSecurity httpSecurity)
+throws Exception {
+httpSecurity
+.csrf()
+.and()
+.oauth2Login()
+.and()
+.authorizeRequests()
+.requestMatchers(PathRequest.toStaticResources().atCommonLocations())
+.permitAll()
+.requestMatchers("/"
+,
+"/health"
+,
+"/register").permitAll()
+.anyRequest().authenticated();
+return httpSecurity.build();
+}
+}
+With Spring Security 5.7.0-M2, the Spring team deprecated the
+WebSecurityConfigurerAdapter class. Previously, we extended
+this class to specify our Spring Security configuration. The Spring
+development team now encourages us to move towards a component-
+based security configuration. Find more information about this
+deprecation here.
+With the configuration above, we first enable CSRF protection (to prevent
+a Cross-Site-Request-Forgery attack). Due to the excellent integration of
+Thymeleaf, Spring MVC, and Spring Security, all our HTML forms are already
+protected by default and include a hidden CSRF token.
+Next, we configure the authentication support for OIDC. With oauth2Login,
+Spring Security refers to either OAuth 2.0 and/or OpenID Connect 1.0 authenti-
+cation. As we follow the default conventions and since we’ve already specified
+10. Building User Registration and Login with Amazon Cognito 213
+the relevant configuration properties inside application-aws.yml, there’s
+nothing more to configure in regard to OIDC.
+The remaining part of the security configuration permits any request to our
+static resources and public endpoints/views. Everything else requires authen-
+tication.
+As part of our application header, we can now include a button to allow users to
+log in. We’ll only show this button whenever an unauthenticated visitor loads
+our application.
+We control this with the isAnonymous() method that is part of the thymeleaf-
+extras-springsecurity5 dependency:
+<li class="nav-item" sec:authorize="isAnonymous()">
+<a class="btn btn-primary" th:href="@{/oauth2/authorization/cognito}">
+Login
+</a>
+</li>
+The login location contains the name of our OAuth 2.0 client/provider: cognito.
+Spring Security takes care of redirecting the user to our Cognito User Pool login
+dialog.
+10. Building User Registration and Login with Amazon Cognito 214
+Amazon Cognito’s hosted sign-in form.
+After the user has entered the correct credentials, they’ll be redirected back
+to our application, and Spring Security will create a valid session for this user.
+Technically speaking, Spring Security creates a Principal in the form of an
+OidcUser. We can then inject that Principal into our Spring MVC controllers:
+10. Building User Registration and Login with Amazon Cognito 215
+@GetMapping
+public String getIndex(Model model, @AuthenticationPrincipal OidcUser user) {
+// extract attributes from the user object
+return "index";
+}
+Or we can get it from the SecurityContextHolder:
+OidcUser user = (OidcUser) SecurityContextHolder
+.getContext()
+.getAuthentication()
+.getPrincipal();
+We can even check the authentication status as part of our Thymeleaf views.
+If we bind the XML namespace http://www.thymeleaf.org/extras/spring-
+security to the sec prefix, we can use it to conditionally render parts of a view
+based on security expressions:
+<!-- rendered for unauthenticated users -->
+<div sec:authorize="isAnonymous()">
+<p>Seems like you are not logged-in yet. Please login first to see your Todos.</p>
+<a class="btn btn-primary" th:href="@{/oauth2/authorization/cognito}">
+Login
+</a>
+</div>
+<!-- rendered for authenticated users -->
+<div sec:authorize="isAuthenticated()">
+<p>Welcome to the protected area!</p>
+<p>Your email: [[${email}]]</p>
+<p>Your claims:</p>
+<ul>
+<li
+th:each="claim : ${claims}"
+th:text="${claim.key} + ': ' + ${claim.value}">
+</li>
+</ul>
+</div>
+10. Building User Registration and Login with Amazon Cognito 216
+Furthermore, we can also access the Spring Security authentication object by
+referring to the expression utility object #authentication.
+<li class="nav-item" sec:authorize="isAuthenticated()">
+Howdy, [[${#authentication.principal.attributes.name}]]!
+</li>
+Shortcomings when Scaling Out
+While this procedure works smoothly when starting the application locally
+or with just one instance, we run into issues once we scale out to multiple
+instances. As our final AWS infrastructure makes sure to run at least two
+instances of our Todo application, we’re affected by this issue.
+Having a stateless application allows scaling out and distributing traffic without
+any problems. Unfortunately, two technical details prevent us from being fully
+stateless with our Todo application. Let’s take a look at the first one.
+A sample OAuth 2.0 Authorization Code Grant request looks like this:
+https://authorization-server.com/oauth/authorize
+?client_id=a17c21ed
+&response_type=code
+&state=5ca75bd30
+&redirect_uri=https%3A%2F%2Fexample-app.com%2Fauth
+&scope=openid
+The specification defines the state parameter as a recommended field. This
+parameter is used to transfer state and also protect from CSRF attacks. Spring
+Security creates a random string for this value and verifies that the same value
+is returned after the user is authenticated.
+This validation fails whenever a callback is routed to a Spring Boot instance that
+didn’t initiate this call and therefore is unaware of this state. Having multiple
+10. Building User Registration and Login with Amazon Cognito 217
+nodes running our application in parallel, the likelihood that this validation
+fails is high.
+One solution is to configure sticky sessions as part of the AWS Elastic Load
+Balancer. This ensures that users are always routed to the same instance they
+were assigned to on their first request.
+We can configure sticky sessions for the ApplicationTargetGroup as part of
+the ServiceInputParameters of our Service CDK construct:
+new Service(
+serviceStack,
+"Service"
+,
+awsEnvironment,
+applicationEnvironment,
+new Service.ServiceInputParameters(...)
+.withStickySessionsEnabled(true)
+);
+The second issue is the creation of in-memory HTTP sessions. Without further
+configuration, the session is only known to the Spring Boot instance that
+created it. If a request arrives at a different instance, Spring Security will reject
+the request. With our sticky session configuration, this won’t happen, as our
+clients are always routed to the same instance.
+With this approach, we lose the benefit of an unnoticed fail-over. Whenever
+one of our instances terminates, the user gets redirected to the other instance
+and has to log in again. That might not be the best user experience, but it’s also
+not too big a concern.
+As an alternative to configuring sticky sessions for our load balancer, Spring
+provides a sub-project called Spring Session. With this sub-project, we can en-
+able clustered sessions for our Spring application by using a persistent storage
+like Hazelcast, MongoDB, or an RDBMS to store session information.
+10. Building User Registration and Login with Amazon Cognito 218
+The persistent storage acts as a single point of truth for all session information
+and is resilient to re-deployments and application failures. Any Spring Boot
+instance will recognize an incoming JSESSIONID even though the session was
+created at a different instance. As Spring Security stores the state parameter
+for the OAuth 2.0 Authorization Code Grant as a session attribute, the callback
+will also be accepted at any instance.
+Both sticky sessions and Spring Session support scaling out our authentication
+and authorization setup. To reduce the additional setup complexity, we’re going
+forward with sticky sessions.
+Logout Process
+Whenever an authenticated user enters our application, we display a logout
+button as part of our main header:
+<li class="nav-item" sec:authorize="isAuthenticated()">
+<form th:action="@{/logout}" method="post">
+<input class="btn btn-danger" type="submit" value="Logout">
+</form>
+</li>
+The /logout route is the default location of Spring Security for handling the
+logout process.
+As our Spring Boot application creates and stores a session for each of our
+users, the first step is to invalidate this session once the user decides to log
+out. This will make the current user unknown to our application. Subsequently,
+all isAnonymous() parts of our Thymeleaf views will evaluate to true.
+However, the user still has an active session at the identity provider. With
+every subsequent attempt to re-login to our application, the users don’t have to
+10. Building User Registration and Login with Amazon Cognito 219
+provide their credentials for Cognito (unless the session expires) and are logged
+in automatically.
+OIDC has a standardized procedure for also logging out the end user at the iden-
+tity provider: OpenID Connect RP (Relying Party)-Initiated Logout 1.0. Unfortu-
+nately, this specification is currently a draft and hence not a strict requirement
+to be compatible.
+In short: the authorization server has to expose an end_session_endpoint
+that accepts a pre-defined list of parameters for logging the user out and then
+redirecting them back to the application.
+Spring Security is already capable of following this standard procedure for
+fully logging out the user. We enable this by specifying the OidcClientIni-
+tiatedLogoutSuccessHandler as part of the logoutSuccessHandler for our
+WebSecurityConfig :
+@Configuration
+public class WebSecurityConfig {
+private final ClientRegistrationRepository clientRegistrationRepository;
+public WebSecurityConfig(
+ClientRegistrationRepository clientRegistrationRepository) {
+this.clientRegistrationRepository = clientRegistrationRepository;
+}
+private OidcClientInitiatedLogoutSuccessHandler oidcLogoutSuccessHandler() {
+OidcClientInitiatedLogoutSuccessHandler successHandler =
+new OidcClientInitiatedLogoutSuccessHandler(clientRegistrationRepository);
+successHandler.setPostLogoutRedirectUri("{baseUrl}");
+return successHandler;
+}
+@Bean
+public SecurityFilterChain securityFilterChain(HttpSecurity httpSecurity)
+throws Exception {
+httpSecurity
+10. Building User Registration and Login with Amazon Cognito 220
+.csrf()
+.and()
+.oauth2Login()
+.and()
+.authorizeRequests()
+.requestMatchers(PathRequest
+.toStaticResources()
+.atCommonLocations())
+.permitAll()
+.requestMatchers("/"
+,
+"/health"
+.permitAll()
+.anyRequest().authenticated()
+.and()
+.logout()
+,
+"/register")
+.logoutSuccessHandler(oidcLogoutSuccessHandler());
+return httpSecurity.build();
+}
+}
+This works fine for identity providers that already support this draft. The sad
+news is that Cognito doesn’t follow this specification (yet). However, Cognito
+exposes an endpoint that we can use to log out an end user. For this to work, we
+have to implement our own LogoutSuccessHandler.
+As the Cognito logout endpoint expects a simple HTTP GET request with two
+query parameters, we can use Spring Security’s SimpleUrlLogoutSuccessHan-
+dler.
+What’s left todo is to override the determineTargetUrl() method and create
+the URL accordingly:
+10. Building User Registration and Login with Amazon Cognito 221
+public class CognitoOidcLogoutSuccessHandler
+extends SimpleUrlLogoutSuccessHandler {
+private final String logoutUrl;
+private final String clientId;
+public CognitoOidcLogoutSuccessHandler(
+String logoutUrl,
+String clientId) {
+this.logoutUrl = logoutUrl;
+this.clientId = clientId;
+}
+@Override
+protected String determineTargetUrl(
+HttpServletRequest request,
+HttpServletResponse response,
+Authentication authentication) {
+UriComponents baseUrl = UriComponentsBuilder
+.fromHttpUrl(UrlUtils.buildFullRequestUrl(request))
+.replacePath(request.getContextPath())
+.replaceQuery(null)
+.fragment(null)
+.build();
+return UriComponentsBuilder
+.fromUri(URI.create(logoutUrl))
+.queryParam("client_id", clientId)
+.queryParam("logout_uri", baseUrl)
+.encode(StandardCharsets.UTF_8)
+.build()
+.toUriString();
+}
+}
+We make both the logoutUrl (representing the logout endpoint of our Cognito
+instance, e.g., https://stratospheric...amazoncognito/logout) and the
+clientId (the app client id of our Todo application) configurable, as these
+depend on the actual Cognito instance.
+10. Building User Registration and Login with Amazon Cognito 222
+The logout_uri parameter is the URL that Cognito will redirect the end user to
+after the logout. This has to be a valid URL that was configured as part of the
+LogoutURLs of the app client. For our application, we redirect all users to the
+base URL of the Todo application.
+With this custom LogoutSuccessHandler in place, we can now define it as a
+bean for when custom.use-cognito-as-identity-provider is set to true and
+inject the relevant credentials and region to configure the handler:
+@Configuration
+public class LogoutSuccessHandlerConfig {
+@Bean
+@ConditionalOnProperty(prefix = "custom"
+,
+name = "use-cognito-as-identity-provider", havingValue = "true")
+public CognitoIdentityProviderClient cognitoIdentityProviderClient(
+AwsRegionProvider regionProvider,
+AwsCredentialsProvider awsCredentialsProvider) {
+return CognitoIdentityProviderClient.builder()
+.credentialsProvider(awsCredentialsProvider)
+.region(regionProvider.getRegion())
+.build();
+}
+}
+Finally, we have to make our HttpSecurity configuration aware of this logout
+handler:
+10. Building User Registration and Login with Amazon Cognito 223
+@Configuration
+public class WebSecurityConfig {
+private final LogoutSuccessHandler logoutSuccessHandler;
+public WebSecurityConfig(LogoutSuccessHandler logoutSuccessHandler) {
+this.logoutSuccessHandler = logoutSuccessHandler;
+}
+@Bean
+public SecurityFilterChain securityFilterChain(HttpSecurity httpSecurity)
+throws Exception {
+httpSecurity
+// ...
+.logout()
+.logoutSuccessHandler(logoutSuccessHandler);
+return httpSecurity.build();
+}
+}
+The only drawback that comes with not implementing a custom LogoutSuc-
+cessHandler is that after a user signs out from our application, the session
+at Cognito is still valid. For every subsequent login attempt, our users will be
+immediately signed in. That’s not a problem per se, but it makes switching
+users within the same browser (without manually clearing cookies, that is)
+more complicated, for example.
+Enabling Local Development
+As already outlined in the chapter Local Development, Cognito is not part of the
+free tier of LocalStack. Therefore, for local development, we’re using Keycloak
+as a compatible OIDC identity provider instead.
+To start and stop a local Keycloak instance we are using Docker Compose. As Key-
+cloak is the only infrastructure component that our Todo application requires at
+10. Building User Registration and Login with Amazon Cognito 224
+this point of the book, our docker-compose.yml file is quite straightforward:
+version: '3.3'
+services:
+keycloak:
+image: quay.io/keycloak/keycloak:18.0.0-legacy
+ports:
+- 8888:8080
+environment:
+- KEYCLOAK_USER=keycloak
+- KEYCLOAK_PASSWORD=keycloak
+- DB_VENDOR=h2
+- JAVA_OPTS=\
+-Dkeycloak.migration.action=import \
+-Dkeycloak.migration.provider=singleFile \
+-Dkeycloak.migration.file=/tmp/stratospheric-realm.json
+volumes:
+- ./src/test/resources/keycloak/stratospheric-realm.json:\
+/tmp/stratospheric-realm.json
+The stratospheric-realm.json file that we are mapping to the inside of the
+Docker container contains the configuration for Keycloak. To avoid any manual
+setup steps (define users, configure the realm, etc.), we import this config
+during Keycloak startup (see the file stratospheric-realm.json on GitHub).
+This config pre-populates three users and registers our Todo application as
+a known client. All that remains to be done is to specify the relevant Spring
+Security properties as part of our application-dev.yml file:
+10. Building User Registration and Login with Amazon Cognito 225
+spring:
+security:
+oauth2:
+client:
+registration:
+cognito:
+clientId: spring-boot-application
+clientSecret: 27b07baf-53ba-42c6-b11f-6384769cada3
+scope: openid
+provider:
+cognito:
+issuerUri: http://localhost:8888/auth/realms/stratospheric
+Since we’re always using the same Keycloak configuration we can hardcode the
+client secret. We are still using cognito as the provider key to avoid further
+complexity in our setup.
+The only feature that’s not working locally is user registration. We’ll still see a
+success message when trying to register but internally we’re doing nothing:
+@Service
+@ConditionalOnProperty(prefix = "custom"
+,
+name = "use-cognito-as-identity-provider", havingValue = "false")
+public class LocalRegistrationService implements RegistrationService {
+@Override
+public void registerUser(Registration registration) {
+// no registration as we use a local Keycloak instance
+// with a pre-defined set of users
+}
+}
+We can still log in to the Todo application by using one of the pre-defined users:
+• tom with password stratospheric
+• bjoern with password stratospheric
+• philip with password stratospheric
+10. Building User Registration and Login with Amazon Cognito 226
+There is good news for the OIDC logout feature mentioned above: Keycloak
+already supports this draft. This means that whenever we start the application
+locally we’ll be able to fully log out.
+This is made possible by switching the actual LogoutSuccessHandler per pro-
+file. If running locally, we instantiate Spring Security’s OidcClientInitiated-
+LogoutSuccessHandler as Keycloak already supports the RP-initiated logout
+specification:
+@Configuration
+public class LogoutSuccessHandlerConfig {
+@Bean
+@ConditionalOnProperty(prefix = "custom", name = "use-cognito-as-identity-provider\
+", havingValue = "false")
+public LogoutSuccessHandler oidcLogoutSuccessHandler(ClientRegistrationRepository \
+clientRegistrationRepository) {
+OidcClientInitiatedLogoutSuccessHandler successHandler = new OidcClientInitiated\
+LogoutSuccessHandler(clientRegistrationRepository);
+successHandler.setPostLogoutRedirectUri("{baseUrl}");
+return successHandler;
+}
+}

@@ -1,0 +1,682 @@
+Connecting to a Database with
+Amazon RDS
+As soon as we want to provide our users with a way of persisting their data
+across sessions we need some sort of data storage. Our sample Todo application
+is no different in that regard because it will allow users to create, edit, and share
+todos.
+Web applications commonly use relational database management systems
+(RDBMS) for storing data. Due to the language generally used for interacting
+with them, these database systems are also more commonly known as SQL
+(Structured Query Language) databases.
+Relational databases store and manage data as rows in tables and relationships
+between those tables. This approach, devised by E. F. Codd in 1970, has been
+the standard way of dealing with persistent data in web applications for a long
+time.
+It was only with the advent of Web 2.0 applications and the NoSQL approach
+promoted in that context that alternatives such as document stores or ob-
+ject databases were widely considered again. Nowadays, such non-relational
+databases are often used in conjunction with relational databases. In the chap-
+ter Tracing User Actions with DynamoDB we’ll talk more about NoSQL databases
+in the context of AWS.
+Relational databases aren’t going anywhere, though, because they are still
+useful for common CRUD (Create, Read, Update, Delete) operations or time-
+11. Connecting to a Database with Amazon RDS 228
+series data, for example. So, we’ll use such a database for our sample Todo
+application, too.
+In the sample Todo application, we’ll be using a database for storing todos as
+well as for managing users and sharing todos, and for that we’ve opted for a
+PostgreSQL RDBMS managed by Amazon Relational Database Service (RDS).
+While setting up the database involves AWS specifics, using it in our Spring-
+based application works just as one would expect from an ordinary, non-cloud,
+non-AWS database.
+But before going into the details of how to use the database from our Spring Boot
+application, let’s explore what Amazon RDS offers and how we can automate the
+provisioning of a database for our application.
+Introduction to AWS Relational Database Service (RDS)
+Amazon Relational Database Service (RDS) is the AWS service for running and
+managing relational databases.
+Apart from PostgreSQL, MySQL, MariaDB, Oracle Database, and Microsoft SQL
+Server, RDS also supports Amazon’s own Aurora database technology. Aurora
+is a MySQL- and PostgreSQL-compatible RDBMS specifically designed with
+requirements of highly scalable cloud applications in mind.
+RDS allows us to create and manage relational databases on AWS using its
+common tools and techniques such as the AWS CLI, IAM, and CDK.
+In addition to using the above tools to integrate the database into our AWS envi-
+ronment, we can manage the database through the Amazon RDS Management
+Console.
+As usual with AWS services, RDS provides a scalable infrastructure that grows
+11. Connecting to a Database with Amazon RDS 229
+according to our application’s and our users’ needs. The underlying environ-
+ment is managed entirely by AWS, which frees us from maintenance headaches.
+Furthermore, RDS supports SSL for encrypting data in transit and with AWS
+Key Management Service (KMS) we can encrypt our data at rest as well. RDS
+integrates with AWS Config to provide us with a way of enforcing compliance
+by recording and auditing changes to database configurations.
+Setting up IAM Permissions
+At this point, we assume that the IAM basics have already been set up as
+described in the chapter Managing Permissions with IAM. To access RDS resources
+during development we simply need to attach the AWS-managed AmazonRDS-
+FullAccess policy to those IAM groups our application developers are in.
+This access is needed to run deploy a new database or make changes to an
+existing database instance via the AWS Console or via the CDK app that we’re
+going to build for that purpose. Once the database is deployed and ready to use,
+it’s best to remove full access again, at least for production-like environments.
+The application itself also needs access to the database, but we will include
+the permissions for that in the CDK app, so it’s completely decoupled from
+developer IAM permissions.
+Creating a Database CDK App
+As we did before for the Cognito resources, we’ll now create a CDK app that
+allows us to deploy a database with a simple CLI command. If you want to browse
+the full code from this chapter, you can find the relevant files on GitHub.
+11. Connecting to a Database with Amazon RDS 230
+The following diagram gives an overview of the additional infrastructure we’re
+going to create for our database:
+Deploying a PostgreSQL instance into our AWS infrastructure.
+That is, in addition to the network and service stacks that we already have, we’ll
+create a new CDK stack for the database. This stack will place a PostgreSQL
+database instance into the private subnets provided by our network stack. The
+application running in our service stack will then connect to the database.
+The PostgresDatabase CDK Construct
+To create the necessary environment for our database we’ll use the Postgres-
+Database construct from our constructs library. You can browse its code on
+GitHub.
+The network stack we created earlier takes care of creating all the basic re-
+sources we need to run our Spring Boot application and our database. When
+deployed, it writes a few parameters to the SSM parameter store, including in-
+formation about the isolated subnets it created for the database. The Postgres-
+Database construct loads these parameters from the parameter store using the
+11. Connecting to a Database with Amazon RDS 231
+the helper method Network.getOutputParametersFromParameterStore():
+public class PostgresDatabase extends Construct {
+// ...
+public PostgresDatabase(
+final Construct scope,
+final String id,
+final Environment awsEnvironment,
+final ApplicationEnvironment applicationEnvironment,
+final DatabaseInputParameters databaseInputParameters) {
+// ...
+Network.NetworkOutputParameters networkOutputParameters =
+Network.getOutputParametersFromParameterStore(
+this,
+applicationEnvironment.getEnvironmentName());
+// ...
+}
+}
+In case these parameters are not present in the parameter store (i.e., when the
+network stack hasn’t been deployed before), the PostgresDatabase construct
+will fail to deploy.
+The PostgresDatabase construct also takes an object of type DatabaseInput-
+Parameters as a parameter, which contains some configuration parameters it
+needs to set up the database.
+Let’s go through the code of the PostgresDatabase to see what it’s doing with
+all these parameters.
+11. Connecting to a Database with Amazon RDS 232
+Database Security Group
+First, the construct creates a database security group into which we’ll later put the
+database. Also, it adds a database subnet group, which combines a set of subnets
+into a group to be used by database instance:
+CfnSecurityGroup databaseSecurityGroup = CfnSecurityGroup.Builder.create(
+this,
+"databaseSecurityGroup")
+.vpcId(networkOutputParameters.getVpcId())
+.groupDescription("Security Group for the database instance")
+.groupName(applicationEnvironment.prefix("dbSecurityGroup"))
+.build();
+CfnDBSubnetGroup subnetGroup = CfnDBSubnetGroup.Builder.create(
+this,
+"dbSubnetGroup")
+.dbSubnetGroupDescription("Subnet group for the RDS instance")
+.dbSubnetGroupName(applicationEnvironment.prefix("dbSubnetGroup"))
+.subnetIds(networkOutputParameters.getIsolatedSubnets())
+.build();
+We will later pass both the subnet group’s name and the security group’s ID into
+the CfnDBInstance construct that creates our database instance.
+Secret for Database Authentication
+Next, we’ll create a Secret called databaseSecret, which will be used as a
+password for the database:
+11. Connecting to a Database with Amazon RDS 233
+ISecret databaseSecret = Secret.Builder.create(this,
+"databaseSecret")
+.secretName(applicationEnvironment.prefix("DatabaseSecret"))
+.description("Credentials to the RDS instance")
+.generateSecretString(SecretStringGenerator.builder()
+.secretStringTemplate(String.format(
+"{\"username\": \"%s\"}"
+,
+username))
+.generateStringKey("password")
+.passwordLength(32)
+.excludeCharacters("@/\\\" ")
+.build())
+.build();
+The secretStringTemplate() method’s argument specifies a JSON structure
+with the user name. The argument of the generateStringKey() method de-
+fines that the generated password be added to this JSON structure in the
+password field. The resulting JSON string will look like this:
+{
+"username": "<value of DBUserName parameter>",
+"password": "<generated password>"
+}
+Using the excludeCharacters() method we’re excluding some characters
+from the password creation because they are not allowed in PostgreSQL
+RDS instances. We’d get an error message saying that “Only printable ASCII
+characters besides ‘/’, ‘@’, ‘”’, ‘ ‘ may be used” if the password contained any
+of these characters.
+Database Instance
+The core of a database stack is, of course, the database instance:
+11. Connecting to a Database with Amazon RDS 234
+String username = sanitizeDbParameterName(applicationEnvironment.prefix("dbUser"));
+CfnDBInstance dbInstance = CfnDBInstance.Builder.create(this,
+"postgresInstance")
+.allocatedStorage(String.valueOf(databaseInputParameters.storageInGb))
+.availabilityZone(networkOutputParameters
+.getAvailabilityZones()
+.get(0))
+.dbInstanceClass(databaseInputParameters.instanceClass)
+.dbName(sanitizeDbParameterName(applicationEnvironment.prefix("database")))
+.dbSubnetGroupName(subnetGroup.getDbSubnetGroupName())
+.engine("postgres")
+.engineVersion(databaseInputParameters.postgresVersion)
+.masterUsername(username)
+.masterUserPassword(databaseSecret
+.secretValueFromJson("password")
+.toString())
+.publiclyAccessible(false)
+.vpcSecurityGroups(singletonList(databaseSecurityGroup.getAttrGroupId()))
+.build();
+We pass the previously created subnetGroup, databaseSecurityGroup, and
+databaseSecret into the DB instance configuration.
+The rest of the configuration parameters we either set statically - like the
+publiclyAccessible parameter, which we set to false - or we read them from
+the databaseInputParameters or the networkOutputParameters.
+Secret Attachment
+Finally, we attach the secret to the database:
+11. Connecting to a Database with Amazon RDS 235
+CfnSecretTargetAttachment.Builder.create(this,
+.secretId(databaseSecret.getSecretArn())
+.targetId(dbInstance.getRef())
+.targetType("AWS::RDS::DBInstance")
+.build();
+"secretTargetAttachment")
+This associates the secret with the database, so we can take advantage of the
+secret rotation feature provided by the AWS Secrets Manager.
+Output Parameters
+Finally, the PostgresDatabase construct exports some resources from the
+database stack, so we can use them from other stacks like our service stack:
+StringParameter endpointAddress =
+StringParameter.Builder.create(this,
+"endpointAddress")
+.parameterName(createParameterName(
+this.applicationEnvironment,
+PARAMETER_ENDPOINT_ADDRESS))
+.stringValue(this.dbInstance.getAttrEndpointAddress())
+.build();
+StringParameter endpointPort =
+StringParameter.Builder.create(this,
+"endpointPort")
+.parameterName(createParameterName(
+this.applicationEnvironment,
+PARAMETER_ENDPOINT_PORT))
+.stringValue(this.dbInstance.getAttrEndpointPort())
+.build();
+StringParameter databaseName =
+StringParameter.Builder.create(this,
+.parameterName(createParameterName(
+this.applicationEnvironment,
+PARAMETER_DATABASE_NAME))
+.stringValue(this.dbInstance.getDbName())
+.build();
+"databaseName")
+StringParameter securityGroupId =
+StringParameter.Builder.create(this,
+"securityGroupId")
+11. Connecting to a Database with Amazon RDS .parameterName(createParameterName(
+this.applicationEnvironment,
+PARAMETER_SECURITY_GROUP_ID))
+.stringValue(this.databaseSecurityGroup.getAttrGroupId())
+.build();
+StringParameter secret =
+StringParameter.Builder.create(this,
+"secret")
+.parameterName(createParameterName(
+this.applicationEnvironment,
+PARAMETER_SECRET_ARN))
+.stringValue(this.databaseSecret.getSecretArn())
+.build();
+236
+We’ll need the endpointAddress, endpointPort, databaseName, security-
+GroupId, and secret parameters in the service stack to connect our Spring Boot
+application to the database.
+Note that parameters stored in the parameter store are not encrypted. That
+means they are visible for anyone with access to the parameter store. If that is
+not sufficient for your security purposes, make sure to store these parameters
+in the AWS Secrets Manager instead.
+However, we keep the database username and password in a Secret, rather
+than as plaintext values. We only store the Secret’s ARN in the parameter store.
+Therefore, no sensitive information is shared through the parameter store.
+The Database CDK App
+Finally, to be able to deploy our PostgresDatabase construct, we wrap it in a
+CDK app called DatabaseApp (the full code is available on GitHub):
+11. Connecting to a Database with Amazon RDS 237
+public class DatabaseApp {
+public static void main(final String[] args) {
+App app = new App();
+String environmentName = (String) app
+.getNode()
+.tryGetContext("environmentName");
+String applicationName = (String) app
+.getNode()
+.tryGetContext("applicationName");
+String accountId = (String) app
+.getNode()
+.tryGetContext("accountId");
+String region = (String) app
+.getNode()
+.tryGetContext("region");
+Environment awsEnvironment = makeEnv(accountId, region);
+ApplicationEnvironment applicationEnvironment = new ApplicationEnvironment(
+applicationName,
+environmentName
+);
+Stack databaseStack = new Stack(
+app,
+"DatabaseStack"
+,
+StackProps.builder()
+.stackName(applicationEnvironment.prefix("Database"))
+.env(awsEnvironment)
+.build());
+new PostgresDatabase(
+databaseStack,
+"Database"
+,
+awsEnvironment,
+applicationEnvironment,
+new PostgresDatabase.DatabaseInputParameters());
+11. Connecting to a Database with Amazon RDS app.synth();
+238
+}
+// ...
+}
+The app creates a Stack and adds a PostgresDatabase construct to it using the
+default DatabaseInputParameters. If we wanted to make any of the parame-
+ters in DatabaseInputParameters configurable, we could pass them into the
+app and then into the DatabaseInputParameters from there.
+Deploying the Database Stack
+To interact with the new database stack, we add the scripts database:deploy
+and database:destroy to the package.json file in our CDK project.
+We can now run these scripts from the command line to deploy a database stack:
+npm run database:deploy
+npm run database:destroy
+Modifying the Service Stack
+What’s left is to tell our Spring Boot application to use the new database.
+For this purpose, we modify the existing service stack that’s responsible for
+deploying the Docker container our application resides in. We add the default
+environment variables Spring Boot uses for defining the database connection:
+• SPRING_DATASOURCE_URL,
+• SPRING_DATASOURCE_USERNAME, and
+• SPRING_DATASOURCE_PASSWORD.
+11. Connecting to a Database with Amazon RDS 239
+Spring Boot will automatically read these environment variables and create a
+data source pointing to our new database.
+To this end, in the ServiceApp we first load a NetworkOutputParameters object
+from the PostgresDatabase construct:
+PostgresDatabase.DatabaseOutputParameters databaseOutputParameters =
+PostgresDatabase.getOutputParametersFromParameterStore(
+parametersStack,
+applicationEnvironment);
+The method getOutputParametersFromParameterStore() is a convenience
+method we built into the database construct. This method loads all the output
+parameters we discussed above into a single object.
+Then, we pass these parameters into the environmentVariables() method,
+which creates a map of all environment variables that should be injected into
+the Docker container of our Spring Boot app:
+public class ServiceApp {
+// ...
+static Map<String, String> environmentVariables(
+Construct scope,
+PostgresDatabase.DatabaseOutputParameters databaseOutputParameters,
+String springProfile) {
+Map<String, String> vars = new HashMap<>();
+String databaseSecretArn = databaseOutputParameters.getDatabaseSecretArn();
+ISecret databaseSecret = Secret.fromSecretCompleteArn(
+scope,
+"databaseSecret"
+,
+databaseSecretArn);
+vars.put("SPRING_DATASOURCE_URL"
+,
+String.format("jdbc:postgresql://%s:%s/%s"
+,
+databaseOutputParameters.getEndpointAddress(),
+11. Connecting to a Database with Amazon RDS 240
+databaseOutputParameters.getEndpointPort(),
+databaseOutputParameters.getDbName()));
+vars.put("SPRING_DATASOURCE_USERNAME"
+,
+databaseSecret.secretValueFromJson("username").toString());
+vars.put("SPRING_DATASOURCE_PASSWORD"
+,
+databaseSecret.secretValueFromJson("password").toString());
+// ...
+return vars;
+}
+// ...
+}
+We combine the parameters EndpointAddress, EndpointPort, and DBName to
+create a valid JDBC URL of this format:
+jdbc:postgresql://<EndpointAddress>:<EndpointPort>/<DBName>
+We load the username and password from the Secret we created in the database
+stack. Note that this secret never leaves the AWS servers! We don’t need to put
+it into a configuration file anywhere!
+Also note that, since the service stack now depends on the output parameters
+of the database stack, we need to deploy the database stack before the service
+stack.
+At this point, our AWS-specific database infrastructure work is done! We now
+can reap the rewards of our efforts: We can use our newly created database stack
+and the PostgreSQL database it contains from our Spring Boot application like
+any other PostgreSQL database.
+11. Connecting to a Database with Amazon RDS 241
+Strategies for Initializing the Database Structure
+Now that the database has been deployed and is up and running, we need
+to create a database schema for our application. There are various ways to
+approach this task. Let’s look at some of those.
+Creating the Database Structure Manually
+The most basic, framework-agnostic technique would be to simply trigger the
+execution of an initialization script after the application start, for example by
+using the @PostConstruct annotation. This approach provides us with more
+control over the initialization process but it also tends to be more brittle and
+error-prone because manually created DDL code might become outdated or out-
+of-sync with the application source code. Moreover, because such DDL code is
+not managed by the framework itself this can lead to unwanted results. For ex-
+ample, scripts intended for development environments might be inadvertently
+executed in production, too!
+Standard DDL Scripts: schema.sql, data.sql
+Spring Boot provides a standard way of creating database schemas and import-
+ing data. It does so via SQL scripts in the root classpath that follow specific
+naming conventions. A schema.sql script located under the root classpath will
+create the required database schema whereas a data.sql will use SQL INSERTs
+to fill that schema with actual data.
+This approach, while standardized and more agnostic than the previous one,
+comes with similar disadvantages: While with this technique the files for gen-
+erating the database structure and populating the database with initial data are
+11. Connecting to a Database with Amazon RDS 242
+managed by Spring Boot, keeping these files in sync with the application source
+code can still become an issue over time.
+DDL Generation with JPA and Hibernate
+Database APIs such as JPA and ORM (object-relational mapping) frameworks
+such as Hibernate can generate or modify a database schema automatically
+upon application start. The advantage of this approach is that the generated
+database structure will automatically correspond to our model classes and appli-
+cation code in general. Therefore, we don’t need to manually maintain separate
+SQL scripts in this case. However, (re)initializing the database in this way might
+not always yield the exact structure we want because these frameworks come
+with conventions. While the default behavior can be customized, this can result
+in complex, hard-to-understand configuration. Another huge downside to this
+technique is that it only manages a single, authoritative state for our database
+structure. This means that at any point there’s only ever one definition of our
+database structure (the current one), and maintaining a version history of the
+database structure quickly becomes cumbersome.
+Database Migration Tools: Liquibase and Flyway
+This is where database migration tools such as Liquibase or Flyway come into
+play. These tools allow us to maintain different versions of our database struc-
+ture that correspond to our application source code at any given time. In a way,
+these tools are version control systems for database schemas.
+Spring Boot integrates with both of these tools. We chose Flyway for its sim-
+plicity and for being the de-facto default approach for Spring Boot applications.
+Rather than an XML-based language for defining migrations, such as the one
+11. Connecting to a Database with Amazon RDS 243
+used by Liquibase, Flyway uses plain old SQL scripts for applying migrations.
+While not as RDBMS-agnostic, this approach is much simpler in that doesn’t
+incur the additional complexity that comes with yet another language we need
+to learn to maintain our application.
+However, subject to your requirements, Liquibase can still be a valid choice. For
+example, depending on the environment, you might want to support multiple
+different RDBMS like PostgreSQL or Oracle Database without having to main-
+tain individual migration scripts for each SQL dialect that comes with those. In
+that case, due to its more agnostic approach, Liquibase might have its merits.
+Configuring the Database in the Todo App
+Having chosen Flyway as our tool for initializing and managing the database
+schema, let’s now dive into the code of our sample application to see how we
+can configure the new database. If you’re already familiar with configuring a
+Spring Boot app to use a SQL database, you can safely skip this section.
+Connecting to the Database
+To connect to the PostgreSQL database instance our sample application needs a
+few additional dependencies:
+11. Connecting to a Database with Amazon RDS dependencies {
+// ...
+implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+runtimeOnly 'org.postgresql:postgresql'
+// ...
+244
+}
+org.postgresql:postgresql contains the JDBC driver for connecting to the
+PostgreSQL database whereas org.springframework.boot:spring-boot-
+starter-data-jpa provides us with Spring Data JPA (and its dependencies),
+a widely used library for accessing databases from within Spring Boot
+applications.
+Now, once we’ve started the service stack, our Spring Boot application will
+automatically connect to the PostgreSQL database using the standard SPRING_-
+DATASOURCE_URL, SPRING_DATASOURCE_USERNAME, and SPRING_DATASOURCE_-
+PASSWORD parameters we set before.
+Initializing the Database
+Because our database is now up and running and our sample Todo application
+is connected to it, we’re now able to use any of the strategies for initializing our
+database discussed above.
+Since we’ve decided to use Flyway for that purpose, we add this dependency to
+our build.gradle file:
+11. Connecting to a Database with Amazon RDS dependencies {
+// ...
+// ...
+implementation 'org.flywaydb:flyway-core'
+245
+}
+We can now add SQL migration files to the default folder used by Flyway for
+PostgreSQL RDBMS. This folder is located under db/migration/postgresql in
+the application’s src/main/resources folder.
+Any .sql files we place in that folder that follow the Flyway naming conventions
+will automatically be executed upon application start.
+We can now start to implement business logic that requires persistent data
+storage for our todo entities! We can do this in the same way as we would for any
+Spring- and JPA-based application, for example with JPA’s @Entity annotation,
+JPA-based repositories, or Spring’s @Repository stereotype.
+Using the Database for Storing and Retrieving Todos
+Now that we’ve prepared the surrounding infrastructure and our Spring Boot
+app is configured to use our new PostgreSQL database, we can finally put it to
+use in our application code.
+If you’re familiar with using JPA in a Spring Boot application, you may safely
+skip this section.
+The domain model of our application is structured around the “Todo” entity, as
+shown in this diagram:
+11. Connecting to a Database with Amazon RDS 246
+Domain model of the Todo app.
+As mentioned in the chapter The Sample Todo Application, our application follows
+a package-by-feature structure. This means that the feature folders collabora-
+tion, person, registration, and todo contain the code artifacts related to each
+of those features. These packages include controllers, service interfaces (and
+their implementations), Spring Data JPA repositories, and data model classes.
+We’ll have a closer look at some of the classes from the dev.stratospheric.todo
+package to examine how we use the newly created PostgreSQL database for our
+application.
+We’ll focus on the Todo class and how it’s used. This class is annotated with the
+@Entity annotation from the jakarta.persistence package (the API provided
+by JPA / Jakarta Persistence). This annotation marks the class as a database entity.
+By default, the unqualified class name (as opposed to its fully-qualified name,
+which would include the package name) is used as the entity’s database table
+name.
+11. Connecting to a Database with Amazon RDS 247
+As mentioned previously, we use Flyway for database initialization and mi-
+gration. Therefore, we need to provide an SQL DDL migration script that cre-
+ates this database table upon application start. As per Flyway conventions
+we’ve named this script V001__INIT_DATABASE.sql and placed it in the /sr-
+c/main/resources/db/migration/postgresql folder.
+The SQL script contains this statement:
+-- ...
+create table TODO
+(
+ID BIGSERIAL not null primary key,
+DESCRIPTION VARCHAR(255),
+DUE_DATE DATE,
+PRIORITY INTEGER,
+STATUS VARCHAR(255),
+TITLE VARCHAR(255),
+OWNER_ID BIGINT,
+constraint FK_TODO_OWNER
+foreign key (OWNER_ID) references PERSON (ID)
+);
+-- ...
+This statement will create the required database table with the columns needed
+for storing the information for each todo. When taking a closer look at the Todo
+class we can see that these columns are reflected in the class’s attributes:
+11. Connecting to a Database with Amazon RDS 248
+// ...
+@Entity
+public class Todo {
+@Id
+@GeneratedValue(strategy = GenerationType.IDENTITY)
+private Long id;
+@NotBlank
+@Size(max = 30)
+private String title;
+@Size(max = 100)
+private String description;
+private Priority priority;
+@NotNull
+@Future
+@DateTimeFormat(pattern = "yyyy-MM-dd")
+private LocalDate dueDate;
+@Enumerated(EnumType.STRING)
+private Status status;
+@ManyToOne
+@JoinColumn(name = "owner_id")
+private Person owner;
+// ...
+}
+Again, as with the entity name and the table name, the attribute names by
+default match the column names. Most of those attributes are annotated with
+one or more annotations. These annotations allow us to further specify rules
+and constraints that should apply to an attribute.
+11. Connecting to a Database with Amazon RDS 249
+Primary Key and Object Identity
+The id attribute is annotated with @Id from the jakarta.persistence package
+marking this attribute as the entity’s unique identifier (or: primary key).
+The @GeneratedValue annotation (also from the jakarta.persistence pack-
+age) denotes that the attribute’s value is generated automatically. The strat-
+egy = GenerationType.IDENTITY argument further specifies that this value is
+provided through an identity column in the database table. This behavior in turn
+is enabled by this column definition from the SQL migration script, specifically
+the BIGSERIAL and primary key keywords:
+-- ...
+ID BIGSERIAL not null primary key
+-- ...
+Constraints and Validation
+Some columns are annotated with annotations from the package
+jakarta.validation.constraints, like @NotBlank, @Size, or @Future.
+Such annotations allow us to define the rules - or: constraints - we’d like to
+apply to each of the attributes and their value. For example, the todo’s title is
+supposed to contain a non-empty (not blank) string with 30 characters at most.
+Storing and Retrieving Information
+Now that we have defined our database entity we can use it for
+storing and retrieving information. With Spring Data JPA, the
+abstraction for doing so is the JpaRepository interface from the
+11. Connecting to a Database with Amazon RDS 250
+org.springframework.data.jpa.repository package. This interface
+provides us with a set of methods for manipulating and retrieving data:
+public interface JpaRepository<T, ID> extends PagingAndSortingRepository<T, ID>, Que\
+ryByExampleExecutor<T> {
+@Override
+List<T> findAll();
+@Override
+List<T> findAll(Sort sort);
+@Override
+List<T> findAllById(Iterable<ID> ids);
+@Override
+<S extends T> List<S> saveAll(Iterable<S> entities);
+// ...
+}
+To use this for a specific database entity such as our Todo class we have to extend
+this interface with our own TodoRepository interface:
+public interface TodoRepository extends JpaRepository<Todo, Long> {
+List<Todo> findAllByOwnerEmailOrderByIdAsc(String email);
+}
+This interface specifies a JpaRepository that’s responsible for persisting Todo
+entities with a Long-typed ID. Moreover, we’ve added a findAllByOwnerE-
+mailOrderByIdAsc() method that allows us to find all Todos whose owner
+has the email address given by the method’s email argument. Spring Data
+JPA uses a query generation mechanism that derives the required SQL query
+from the method name (see Defining Query Methods from the Spring Data JPA
+documentation for more information).
+The TodoRepository then can be injected into other classes, like our TodoSer-
+vice, via Spring’s dependency injection:
+11. Connecting to a Database with Amazon RDS 251
+// ...
+@Service
+public class TodoService {
+private final TodoRepository todoRepository;
+private final PersonRepository personRepository;
+public TodoService(
+TodoRepository todoRepository,
+PersonRepository personRepository) {
+this.todoRepository = todoRepository;
+this.personRepository = personRepository;
+}
+public Todo saveNewTodo(Todo todo) {
+// ...
+return todoRepository.save(todo);
+}
+}
+Spring will automatically inject the TodoRepository into the constructor of
+TodoService. With this dependency, we now can insert a new row into the
+database table by calling todoRepository.save().
+The TodoService, in turn, is injected into the TodoController, again using
+constructor injection, where it is used for creating, retrieving, updating, and
+deleting Todos in various controller methods. These controller methods are
+mapped to HTTP paths within our application that can be accessed through
+HTTP GET (in case of the methods annotated with @GetMapping) and POST (for
+those methods annotated with @PostMapping) requests.
+Finally, the Thymeleaf template in our application’s resources/templates
+folder, specifically dashboard.html, show.html, and edit.html, make use of
+these controller methods to allow the user to display and edit todos.
+11. Connecting to a Database with Amazon RDS 252
+Enabling Local Development
+One thing is still missing in our setup: In most cases, we wouldn’t want to
+wait until our entire AWS infrastructure has been redeployed through our
+continuous deployment pipeline after a code change. Instead, we want to test
+changes locally.
+That’s where a local database instance comes into play. We can use Docker to
+spin one up by adding a service to the docker-compose.yml file located in our
+application’s root directory:
+services:
+postgres:
+image: postgres:12.9
+ports:
+- 5432:5432
+environment:
+- POSTGRES_USER=stratospheric
+- POSTGRES_PASSWORD=stratospheric
+- POSTGRES_DB=stratospheric
+# ...
+With these lines added to the docker-compose.yml file, we can now run docker-
+compose up from the command line in our application’s root directory to start
+a PostgreSQL instance alongside other services already defined in our docker-
+compose.yml.
+Now, all we have to do is add these lines to a application-dev.yml properties
+file in our application’s src/main/resources folder:
+11. Connecting to a Database with Amazon RDS 253
+spring:
+datasource:
+url: jdbc:postgresql://localhost:5432/stratospheric
+username: stratospheric
+password: stratospheric
+# ...
+Since our build.gradle file already configures Gradle to use dev as Spring
+Profile (by using -Dspring.profiles.active=dev as a JVM argument) these
+settings will be picked up automatically when running ./gradlew bootrun:
+// ...
+bootRun {
+jvmArgs = [
+"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005",
+"-Dspring.profiles.active=dev",
+]
+}
